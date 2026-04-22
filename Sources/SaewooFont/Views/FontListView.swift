@@ -60,9 +60,10 @@ struct FamilyGroupRow: View {
 
                 starButton(for: primary)
 
-                Text(primary.category.label)
+                Text(primary.categories.map(\.label).joined(separator: " · "))
                     .font(.caption).foregroundStyle(.secondary)
-                    .frame(width: 100, alignment: .leading)
+                    .lineLimit(1).truncationMode(.tail)
+                    .frame(width: 160, alignment: .leading)
             }
             .padding(.horizontal, 14).padding(.vertical, 6)
             .contentShape(Rectangle())
@@ -178,6 +179,8 @@ struct FontPreviewText: View {
     let item: FontItem
     let size: Double
     let text: String
+    /// Optional variation axis overrides, keyed by axis tag. Pass `nil` for default instance.
+    var variations: [UInt32: Double]? = nil
 
     var body: some View {
         Text(AttributedString(attributedString(text: text, item: item, size: size)))
@@ -185,7 +188,7 @@ struct FontPreviewText: View {
     }
 
     private func attributedString(text: String, item: FontItem, size: Double) -> NSAttributedString {
-        let font = FontPreviewCache.shared.font(for: item, size: CGFloat(size))
+        let font = FontPreviewCache.shared.font(for: item, size: CGFloat(size), variations: variations)
                 ?? NSFont.systemFont(ofSize: CGFloat(size))
         return NSAttributedString(string: text, attributes: [
             .font: font,
@@ -196,25 +199,50 @@ struct FontPreviewText: View {
 
 final class FontPreviewCache {
     static let shared = FontPreviewCache()
-    private var cache: [String: NSFont] = [:]
-    func font(for item: FontItem, size: CGFloat) -> NSFont? {
-        let key = "\(item.postScriptName)::\(size)"
-        if let cached = cache[key] { return cached }
-        // Try by PS name first (works if activated or if it's a system font).
-        if let f = NSFont(name: item.postScriptName, size: size) {
-            cache[key] = f
+
+    /// NSCache gives us automatic LRU-ish eviction once we exceed `countLimit`,
+    /// and is thread-safe. 1000 cached NSFonts is enough to cover a typical
+    /// visible list without unbounded memory growth over a long session.
+    private let cache: NSCache<NSString, NSFont> = {
+        let c = NSCache<NSString, NSFont>()
+        c.countLimit = 1000
+        return c
+    }()
+
+    func font(for item: FontItem, size: CGFloat, variations: [UInt32: Double]? = nil) -> NSFont? {
+        let varKey = variations.map { dict in
+            dict.keys.sorted().map { "\($0)=\(dict[$0]!)" }.joined(separator: ",")
+        } ?? ""
+        // Quantize size so nearly-identical slider values (e.g. 36.0 vs 36.0000001)
+        // hit the same cache entry.
+        let qsize = (size * 10).rounded() / 10
+        let key = "\(item.postScriptName)::\(qsize)::\(varKey)" as NSString
+        if let cached = cache.object(forKey: key) { return cached }
+
+        // Non-variation path: try PS name (fast) first.
+        if variations == nil, let f = NSFont(name: item.postScriptName, size: size) {
+            cache.setObject(f, forKey: key)
             return f
         }
-        // Fallback: create a Core Text font straight from the URL (preview without activation).
+
+        // Variation path (or fallback): build from URL descriptors so we can attach axis values.
         let descs = CTFontManagerCreateFontDescriptorsFromURL(item.fileURL as CFURL) as? [CTFontDescriptor]
-        if let desc = descs?.first(where: { d in
+        guard var desc = descs?.first(where: { d in
             (CTFontDescriptorCopyAttribute(d, kCTFontNameAttribute) as? String) == item.postScriptName
-        }) ?? descs?.first {
-            let ct = CTFontCreateWithFontDescriptor(desc, size, nil)
-            let ns = ct as NSFont
-            cache[key] = ns
-            return ns
+        }) ?? descs?.first else {
+            return nil
         }
-        return nil
+        if let v = variations, !v.isEmpty {
+            var dict: [NSNumber: NSNumber] = [:]
+            for (tag, value) in v {
+                dict[NSNumber(value: tag)] = NSNumber(value: value)
+            }
+            let attrs = [kCTFontVariationAttribute: dict as CFDictionary] as CFDictionary
+            desc = CTFontDescriptorCreateCopyWithAttributes(desc, attrs)
+        }
+        let ct = CTFontCreateWithFontDescriptor(desc, size, nil)
+        let ns = ct as NSFont
+        cache.setObject(ns, forKey: key)
+        return ns
     }
 }

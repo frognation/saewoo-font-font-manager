@@ -1,125 +1,394 @@
 import SwiftUI
 import AppKit
 
+/// Sidebar with a three-tier visual hierarchy:
+///
+/// 1. **Sources** — every folder being scanned
+/// 2. **Library** — all ways to browse the fonts (Overview / Categories /
+///    Moods / Foundries / Projects / Palettes)
+/// 3. **Tools** — library-maintenance actions
+///
+/// Each top-level section has a big prominent header with a colored glyph and
+/// semibold title. Inside Library, smaller sub-section headers group related
+/// browsing filters. Everything collapses independently and the collapse state
+/// persists via `@AppStorage`.
 struct SidebarView: View {
     @EnvironmentObject var lib: FontLibrary
-    @State private var showAddCollection: (FontCollection.Kind)? = nil
-    @State private var collectionName: String = ""
+    @AppStorage("sidebar.collapsedSections") private var collapsedCSV: String = ""
 
-    var body: some View {
-        List(selection: Binding(
+    private var collapsed: Set<String> {
+        Set(collapsedCSV.split(separator: ",").map(String.init).filter { !$0.isEmpty })
+    }
+
+    private func isExpanded(_ id: String) -> Bool { !collapsed.contains(id) }
+
+    private func toggle(_ id: String) {
+        var s = collapsed
+        if s.contains(id) { s.remove(id) } else { s.insert(id) }
+        collapsedCSV = s.sorted().joined(separator: ",")
+    }
+
+    private var selectionBinding: Binding<SidebarItem?> {
+        Binding(
             get: { lib.sidebarSelection },
             set: { if let v = $0 { lib.sidebarSelection = v } }
-        )) {
-            Section("Library") {
-                rowLabel(.allFonts, title: "All Fonts", icon: "square.grid.2x2", count: lib.items.count)
-                rowLabel(.active, title: "Active", icon: "circle.fill", tint: .green, count: lib.activeFontIDs.count)
-                rowLabel(.inactive, title: "Inactive", icon: "circle", count: max(0, lib.items.count - lib.activeFontIDs.count))
-                rowLabel(.favorites, title: "Favorites", icon: "star.fill", tint: .yellow, count: lib.favorites.count)
-            }
+        )
+    }
 
-            Section("Categories") {
-                ForEach(lib.categoryCounts, id: \.0) { cat, count in
-                    rowLabel(.category(cat), title: cat.label, icon: cat.icon, count: count)
-                }
-            }
+    // MARK: - Body
 
-            Section("Moods") {
-                ForEach(lib.moodCounts, id: \.0) { mood, count in
-                    rowLabel(.mood(mood), title: mood.label, icon: moodIcon(mood), count: count)
-                }
-            }
-
-            Section {
-                ForEach(lib.collections.filter { $0.kind == .project }) { c in
-                    collectionRow(c)
-                }
-            } header: {
-                HStack {
-                    Text("Projects")
-                    Spacer()
-                    Button { showAddCollection = .project; collectionName = "" } label: {
-                        Image(systemName: "plus")
-                    }
-                    .buttonStyle(.plain).help("New project")
-                }
-            }
-
-            Section {
-                ForEach(lib.collections.filter { $0.kind == .palette }) { c in
-                    collectionRow(c)
-                }
-            } header: {
-                HStack {
-                    Text("Palettes")
-                    Spacer()
-                    Button { showAddCollection = .palette; collectionName = "" } label: {
-                        Image(systemName: "plus")
-                    }
-                    .buttonStyle(.plain).help("New palette")
-                }
-            }
-
-            Section("Sources") {
-                ForEach(FontScanner.defaultSearchRoots, id: \.self) { url in
-                    Label(url.lastPathComponent, systemImage: "folder")
-                        .foregroundStyle(.secondary)
-                        .font(.caption)
-                }
-                ForEach(lib.customScanPaths, id: \.self) { url in
-                    HStack {
-                        Label(url.lastPathComponent, systemImage: "folder.badge.plus")
-                            .font(.caption)
-                        Spacer()
-                        Button { lib.removeCustomScanPath(url) } label: { Image(systemName: "xmark.circle") }
-                            .buttonStyle(.plain)
-                    }
-                }
-                Button {
-                    pickFolder()
-                } label: {
-                    Label("Add Folder…", systemImage: "plus.circle").font(.caption)
-                }.buttonStyle(.plain)
-            }
+    var body: some View {
+        List(selection: selectionBinding) {
+            sourcesSection
+            librarySection
+            toolsSection
         }
         .listStyle(.sidebar)
-        .sheet(item: Binding(get: {
-            showAddCollection.map { IdentifiedKind(kind: $0) }
-        }, set: { _ in showAddCollection = nil })) { wrap in
-            AddCollectionSheet(kind: wrap.kind) { name, color in
-                lib.addCollection(name: name, kind: wrap.kind, colorHex: color)
-                showAddCollection = nil
-            } cancel: { showAddCollection = nil }
+    }
+
+    // MARK: - Top-level sections
+
+    @ViewBuilder
+    private var sourcesSection: some View {
+        topSection(id: "sources", title: "Sources",
+                   icon: "externaldrive.connected.to.line.below",
+                   tint: .blue,
+                   trailing: { addFolderButton }) {
+            ForEach(lib.displayableDefaultSources, id: \.self) { url in
+                sourceRow(url, removable: false)
+            }
+            ForEach(lib.customScanPaths, id: \.self) { url in
+                sourceRow(url, removable: true)
+            }
+            if hasAutoOrManuallyHidden { hiddenSourcesMenu }
         }
     }
 
-    // MARK: - Row helpers
+    @ViewBuilder
+    private var librarySection: some View {
+        topSection(id: "library", title: "Library",
+                   icon: "books.vertical.fill",
+                   tint: .accentColor) {
+            subSection(id: "lib-overview", title: "Overview") {
+                rowLabel(.allFonts, title: "All Fonts",
+                         icon: "square.grid.2x2", count: lib.items.count)
+                rowLabel(.active, title: "Active",
+                         icon: "circle.fill", tint: .green,
+                         count: lib.activeFontIDs.count)
+                rowLabel(.inactive, title: "Inactive", icon: "circle",
+                         count: max(0, lib.items.count - lib.activeFontIDs.count))
+                rowLabel(.favorites, title: "Favorites", icon: "star.fill",
+                         tint: .yellow, count: lib.favorites.count)
+                if lib.variableCount > 0 {
+                    rowLabel(.variable, title: "Variable",
+                             icon: "slider.horizontal.3", tint: .purple,
+                             count: lib.variableCount)
+                }
+            }
+            subSection(id: "lib-categories", title: "Categories") {
+                ForEach(lib.categoryCounts, id: \.0) { cat, count in
+                    rowLabel(.category(cat), title: cat.label,
+                             icon: cat.icon, count: count)
+                }
+            }
+            subSection(id: "lib-moods", title: "Moods") {
+                ForEach(lib.moodCounts, id: \.0) { mood, count in
+                    rowLabel(.mood(mood), title: mood.label,
+                             icon: moodIcon(mood), count: count)
+                }
+            }
+            subSection(id: "lib-foundries", title: "Foundries") {
+                ForEach(lib.foundryCounts, id: \.0) { name, count in
+                    foundryRow(name: name, count: count)
+                }
+            }
+            subSection(id: "lib-projects", title: "Projects",
+                       trailing: { addCollectionButton(.project) }) {
+                ForEach(lib.collections.filter { $0.kind == .project }) { c in
+                    collectionRow(c)
+                }
+            }
+            subSection(id: "lib-palettes", title: "Palettes",
+                       trailing: { addCollectionButton(.palette) }) {
+                ForEach(lib.collections.filter { $0.kind == .palette }) { c in
+                    collectionRow(c)
+                }
+            }
+        }
+    }
 
     @ViewBuilder
-    private func rowLabel(_ item: SidebarItem, title: String, icon: String, tint: Color = .accentColor, count: Int? = nil) -> some View {
-        HStack {
-            Label {
-                Text(title)
-            } icon: {
-                Image(systemName: icon).foregroundStyle(tint)
+    private var toolsSection: some View {
+        topSection(id: "tools", title: "Tools",
+                   icon: "wrench.and.screwdriver.fill",
+                   tint: .pink) {
+            rowLabel(.tool(.duplicates),
+                     title: ToolKind.duplicates.label,
+                     icon: ToolKind.duplicates.icon,
+                     tint: ToolKind.duplicates.tint,
+                     count: lib.duplicateGroups.count > 0 ? lib.duplicateGroups.count : nil)
+            rowLabel(.tool(.organize),
+                     title: ToolKind.organize.label,
+                     icon: ToolKind.organize.icon,
+                     tint: ToolKind.organize.tint)
+            rowLabel(.tool(.proofSheet),
+                     title: ToolKind.proofSheet.label,
+                     icon: ToolKind.proofSheet.icon,
+                     tint: ToolKind.proofSheet.tint)
+            rowLabel(.tool(.orphans),
+                     title: ToolKind.orphans.label,
+                     icon: ToolKind.orphans.icon,
+                     tint: ToolKind.orphans.tint,
+                     count: lib.orphanURLs.count > 0 ? lib.orphanURLs.count : nil)
+            rowLabel(.tool(.missingRefs),
+                     title: ToolKind.missingRefs.label,
+                     icon: ToolKind.missingRefs.icon,
+                     tint: ToolKind.missingRefs.tint,
+                     count: lib.missingReferences.count > 0 ? lib.missingReferences.count : nil)
+            rowLabel(.tool(.largeFiles),
+                     title: ToolKind.largeFiles.label,
+                     icon: ToolKind.largeFiles.icon,
+                     tint: ToolKind.largeFiles.tint)
+        }
+    }
+
+    // MARK: - Section wrappers
+
+    @ViewBuilder
+    private func topSection<Trailing: View, Content: View>(
+        id: String,
+        title: String,
+        icon: String,
+        tint: Color,
+        @ViewBuilder trailing: () -> Trailing = { EmptyView() },
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let expanded = isExpanded(id)
+        Section {
+            if expanded { content() }
+        } header: {
+            HStack(spacing: 8) {
+                Button { toggle(id) } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 12)
+                        Image(systemName: icon)
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(tint)
+                            .frame(width: 22)
+                        Text(title)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.primary)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                trailing()
             }
-            Spacer()
+            .padding(.vertical, 4)
+        }
+    }
+
+    /// Lightweight intra-section header — used inside Library to group
+    /// Categories / Moods / Foundries / etc. Tappable for expand/collapse.
+    @ViewBuilder
+    private func subSection<Trailing: View, Content: View>(
+        id: String,
+        title: String,
+        @ViewBuilder trailing: () -> Trailing = { EmptyView() },
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let expanded = isExpanded(id)
+        HStack(spacing: 4) {
+            Button { toggle(id) } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 10)
+                    Text(title.uppercased())
+                        .font(.system(size: 10, weight: .semibold))
+                        .tracking(0.6)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            trailing()
+        }
+        .padding(.top, 8).padding(.bottom, 2)
+
+        if expanded { content() }
+    }
+
+    // MARK: - Header trailing buttons
+
+    private var addFolderButton: some View {
+        Button { pickFolder() } label: { Image(systemName: "plus") }
+            .buttonStyle(.plain).help("Add a folder to scan")
+    }
+
+    private func addCollectionButton(_ kind: FontCollection.Kind) -> some View {
+        Button {
+            if let result = NewCollectionPrompt.show(kind: kind) {
+                lib.addCollection(name: result.name, kind: kind, colorHex: result.color)
+            }
+        } label: { Image(systemName: "plus") }
+            .buttonStyle(.plain)
+            .help(kind == .project ? "New project" : "New palette")
+    }
+
+    // MARK: - Rows
+
+    @ViewBuilder
+    private func rowLabel(_ item: SidebarItem, title: String, icon: String,
+                          tint: Color = .accentColor, count: Int? = nil) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 14))
+                .foregroundStyle(tint)
+                .frame(width: 20)
+            Text(title).font(.system(size: 13))
+            Spacer(minLength: 4)
             if let count, count > 0 {
-                Text("\(count)").font(.caption).foregroundStyle(.secondary)
+                Text("\(count)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 6).padding(.vertical, 1)
                     .background(Color.secondary.opacity(0.15), in: Capsule())
             }
         }
+        .padding(.vertical, 3)
         .tag(item)
+    }
+
+    /// True if any default source is hidden — either explicitly or implicitly (<2 fonts).
+    private var hasAutoOrManuallyHidden: Bool {
+        if !lib.hiddenDefaultSources.isEmpty { return true }
+        return lib.visibleDefaultSources.contains { lib.itemsInSource($0).count < 2 }
+    }
+
+    @ViewBuilder
+    private func sourceRow(_ url: URL, removable: Bool) -> some View {
+        let count = lib.itemsInSource(url).count
+        let label = removable ? url.lastPathComponent : FontLibrary.label(for: url)
+        HStack(spacing: 10) {
+            Image(systemName: removable ? "folder.badge.plus" : "folder")
+                .font(.system(size: 14))
+                .foregroundStyle(.blue)
+                .frame(width: 20)
+            Text(label).font(.system(size: 13)).lineLimit(1)
+            Spacer(minLength: 4)
+            if count > 0 {
+                Text("\(count)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.15), in: Capsule())
+            }
+        }
+        .padding(.vertical, 3)
+        .tag(SidebarItem.source(url))
+        .help(url.path)
+        .contextMenu {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            }
+            Divider()
+            Button("Activate All in Folder") {
+                Task { await lib.setActiveMany(lib.itemsInSource(url), active: true) }
+            }
+            Button("Deactivate All in Folder") {
+                Task { await lib.setActiveMany(lib.itemsInSource(url), active: false) }
+            }
+            Divider()
+            if removable {
+                Button("Remove from Sources", role: .destructive) {
+                    lib.removeCustomScanPath(url)
+                }
+            } else {
+                Button("Hide from Sidebar") { lib.hideDefaultSource(url) }
+            }
+        }
+    }
+
+    private var hiddenSourcesMenu: some View {
+        let auto = lib.visibleDefaultSources.filter { lib.itemsInSource($0).count < 2 }
+        let manual = Array(lib.hiddenDefaultSources).map { URL(fileURLWithPath: $0) }
+        let all = (auto + manual).sorted { $0.path < $1.path }
+
+        return Menu {
+            ForEach(all, id: \.self) { url in
+                Button("Show \(FontLibrary.label(for: url)) — \(url.path)") {
+                    if lib.hiddenDefaultSources.contains(url.standardizedFileURL.path) {
+                        lib.unhideDefaultSource(url)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "eye.slash")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
+                Text("Hidden sources (\(all.count))")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 3)
+        }
+    }
+
+    @ViewBuilder
+    private func foundryRow(name: String, count: Int) -> some View {
+        let faces = lib.itemsInFoundry(name)
+        let allActive = !faces.isEmpty && faces.allSatisfy { lib.isActive($0) }
+        let anyActive = faces.contains { lib.isActive($0) }
+        HStack(spacing: 10) {
+            Image(systemName: "building.2")
+                .font(.system(size: 14))
+                .foregroundStyle(name == "Unknown" ? Color.secondary : Color.teal)
+                .frame(width: 20)
+            Text(name).font(.system(size: 13)).lineLimit(1)
+            Spacer(minLength: 4)
+            Button {
+                Task { await lib.setActiveMany(faces, active: !allActive) }
+            } label: {
+                Circle()
+                    .fill(allActive ? Color.green : (anyActive ? Color.yellow : Color.secondary.opacity(0.3)))
+                    .frame(width: 7, height: 7)
+            }
+            .buttonStyle(.plain)
+            .help(allActive ? "Deactivate all from this foundry" : "Activate all from this foundry")
+            Text("\(count)")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6).padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.15), in: Capsule())
+        }
+        .padding(.vertical, 3)
+        .tag(SidebarItem.foundry(name))
+        .contextMenu {
+            Button("Activate All from \(name)") {
+                Task { await lib.setActiveMany(faces, active: true) }
+            }
+            Button("Deactivate All from \(name)") {
+                Task { await lib.setActiveMany(faces, active: false) }
+            }
+        }
     }
 
     @ViewBuilder
     private func collectionRow(_ c: FontCollection) -> some View {
-        HStack {
-            Circle().fill(Color(hex: c.colorHex) ?? .accentColor).frame(width: 8, height: 8)
-            Text(c.name).lineLimit(1)
-            Spacer()
-            // Batch toggle: one tap activates/deactivates the whole collection.
+        HStack(spacing: 10) {
+            Circle().fill(Color(hex: c.colorHex) ?? .accentColor).frame(width: 10, height: 10)
+                .padding(.leading, 5) // align with icon-centered rows
+            Text(c.name).font(.system(size: 13)).lineLimit(1)
+            Spacer(minLength: 4)
             Button {
                 Task { await lib.toggleCollectionActive(c) }
             } label: {
@@ -128,13 +397,26 @@ struct SidebarView: View {
             }
             .buttonStyle(.plain)
             .help(lib.isCollectionFullyActive(c) ? "Deactivate all" : "Activate all")
-
-            Text("\(c.fontIDs.count)").font(.caption2).foregroundStyle(.secondary)
+            Text("\(c.fontIDs.count)")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
         }
+        .padding(.vertical, 3)
         .tag(SidebarItem.collection(c.id))
         .contextMenu {
-            Button("Activate All") { Task { await lib.setActiveMany(lib.items.filter { c.fontIDs.contains($0.id) }, active: true) } }
-            Button("Deactivate All") { Task { await lib.setActiveMany(lib.items.filter { c.fontIDs.contains($0.id) }, active: false) } }
+            Button("Activate All") {
+                Task { await lib.setActiveMany(lib.items.filter { c.fontIDs.contains($0.id) }, active: true) }
+            }
+            Button("Deactivate All") {
+                Task { await lib.setActiveMany(lib.items.filter { c.fontIDs.contains($0.id) }, active: false) }
+            }
+            Divider()
+            Menu("Change Color") {
+                ForEach(["#7DD3FC", "#A78BFA", "#F472B6", "#FB923C",
+                         "#FACC15", "#4ADE80", "#22D3EE", "#F87171"], id: \.self) { hex in
+                    Button(hex) { lib.setCollectionColor(c.id, hex: hex) }
+                }
+            }
             Divider()
             Button("Delete \(c.kind == .project ? "Project" : "Palette")", role: .destructive) {
                 lib.deleteCollection(c.id)
@@ -165,11 +447,6 @@ struct SidebarView: View {
             lib.addCustomScanPath(url)
         }
     }
-}
-
-private struct IdentifiedKind: Identifiable {
-    let kind: FontCollection.Kind
-    var id: String { kind.rawValue }
 }
 
 extension Color {

@@ -3,6 +3,7 @@ import AppKit
 
 struct InspectorView: View {
     @EnvironmentObject var lib: FontLibrary
+    @State private var playgroundItem: FontItem? = nil
 
     var body: some View {
         if let id = lib.selectedFontID, let item = lib.items.first(where: { $0.id == id }) {
@@ -47,6 +48,10 @@ struct InspectorView: View {
                             .buttonStyle(.bordered)
                     }
 
+                    if item.isVariable {
+                        VariableFontSection(item: item, openPlayground: { playgroundItem = item })
+                    }
+
                     // Metadata grid
                     MetadataGrid(item: item)
 
@@ -54,7 +59,9 @@ struct InspectorView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Classification").font(.headline)
                         HStack {
-                            tag(item.category.label, icon: item.category.icon, color: .accentColor)
+                            ForEach(item.categories) { c in
+                                tag(c.label, icon: c.icon, color: .accentColor)
+                            }
                             ForEach(item.moods) { m in
                                 tag(m.label, icon: "tag", color: .indigo.opacity(0.7))
                             }
@@ -94,6 +101,10 @@ struct InspectorView: View {
             }
             .frame(minWidth: 320)
             .background(Color(NSColor.windowBackgroundColor))
+            .sheet(item: $playgroundItem) { target in
+                VariablePlaygroundView(item: target)
+                    .environmentObject(lib)
+            }
         } else {
             VStack(spacing: 10) {
                 Image(systemName: "textformat").font(.largeTitle).foregroundStyle(.secondary)
@@ -114,6 +125,71 @@ struct InspectorView: View {
         .padding(.horizontal, 8).padding(.vertical, 3)
         .background(color.opacity(0.15), in: Capsule())
         .foregroundStyle(color)
+    }
+}
+
+/// Inspector section shown only for variable fonts — summarises axes and
+/// surfaces the playground entry point + any saved instances.
+struct VariableFontSection: View {
+    @EnvironmentObject var lib: FontLibrary
+    let item: FontItem
+    let openPlayground: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "slider.horizontal.3")
+                Text("Variable").font(.headline)
+                Text("\(item.variationAxes.count) axes")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                Spacer()
+                Button(action: openPlayground) {
+                    Label("Playground", systemImage: "slider.horizontal.below.rectangle")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(item.variationAxes) { ax in
+                    HStack(spacing: 6) {
+                        Text(ax.tagString)
+                            .font(.system(.caption2, design: .monospaced))
+                            .frame(width: 42, alignment: .leading)
+                        Text(ax.name).font(.caption)
+                        Spacer()
+                        Text("\(shortNum(ax.minValue)) … \(shortNum(ax.maxValue))")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            let instances = lib.instances(for: item)
+            if !instances.isEmpty {
+                Divider()
+                Text("Saved instances").font(.caption).foregroundStyle(.secondary)
+                ForEach(instances) { inst in
+                    HStack {
+                        Image(systemName: "bookmark.fill").foregroundStyle(Color.accentColor)
+                        Text(inst.name).font(.caption)
+                        Spacer()
+                        Button("Open") { openPlayground() }
+                            .buttonStyle(.borderless).font(.caption)
+                        Button {
+                            lib.deleteVariableInstance(inst.id)
+                        } label: { Image(systemName: "xmark.circle") }
+                            .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
+    private func shortNum(_ v: Double) -> String {
+        if abs(v - v.rounded()) < 0.01 { return "\(Int(v.rounded()))" }
+        return String(format: "%.1f", v)
     }
 }
 

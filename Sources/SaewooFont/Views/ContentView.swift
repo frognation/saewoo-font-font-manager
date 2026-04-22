@@ -4,15 +4,31 @@ struct ContentView: View {
     @EnvironmentObject var lib: FontLibrary
     @State private var showInspector = true
 
+    /// Swap the family list for a tool view when a `.tool` row is selected.
+    @ViewBuilder
+    private var mainContent: some View {
+        switch lib.sidebarSelection {
+        case .tool(.duplicates):  DuplicatesView()
+        case .tool(.organize):    OrganizeView()
+        case .tool(.proofSheet):  ProofSheetView()
+        case .tool(.orphans):     OrphansView()
+        case .tool(.missingRefs): MissingRefsView()
+        case .tool(.largeFiles):  LargeFilesView()
+        default:                  FontListView()
+        }
+    }
+
     var body: some View {
         NavigationSplitView {
             SidebarView()
                 .frame(minWidth: 240)
         } content: {
             VStack(spacing: 0) {
-                TopToolbar()
-                Divider()
-                FontListView()
+                if !lib.sidebarSelection.isTool {
+                    TopToolbar()
+                    Divider()
+                }
+                mainContent
             }
             .frame(minWidth: 520)
         } detail: {
