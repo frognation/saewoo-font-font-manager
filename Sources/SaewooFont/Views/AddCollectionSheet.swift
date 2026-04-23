@@ -28,12 +28,26 @@ enum NewCollectionPrompt {
         let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         tf.placeholderString = "Name"
         tf.bezelStyle = .roundedBezel
+        // Explicit flags — defaults *should* match these but we've been burned
+        // by subtle responder-chain bugs where the cell was in a weird state.
+        tf.isEditable = true
+        tf.isSelectable = true
+        tf.usesSingleLineMode = true
+        tf.cell?.wraps = false
+        tf.cell?.isScrollable = true
         alert.accessoryView = tf
 
         // Forcing the alert's window to layout ensures the accessoryView is
         // already installed when we set initialFirstResponder.
         alert.layout()
         alert.window.initialFirstResponder = tf
+        // Belt-and-suspenders: on some macOS/SwiftUI combos the alert's
+        // initialFirstResponder is overridden to the default button once the
+        // modal session starts. Forcing firstResponder here AND relying on
+        // initialFirstResponder covers both paths. The caller in SidebarView
+        // also wraps this in a Task to get off SwiftUI's event stack before
+        // runModal() is entered.
+        alert.window.makeFirstResponder(tf)
 
         let response = alert.runModal()
         guard response == .alertFirstButtonReturn else { return nil }

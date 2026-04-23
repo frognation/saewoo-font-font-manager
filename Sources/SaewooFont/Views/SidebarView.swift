@@ -234,8 +234,17 @@ struct SidebarView: View {
 
     private func addCollectionButton(_ kind: FontCollection.Kind) -> some View {
         Button {
-            if let result = NewCollectionPrompt.show(kind: kind) {
-                lib.addCollection(name: result.name, kind: kind, colorHex: result.color)
+            // IMPORTANT: dispatch to the next main-loop tick before showing the
+            // NSAlert. If we call runModal() synchronously from inside the
+            // SwiftUI Button action, SwiftUI's hosting chain keeps intercepting
+            // key events for the duration of the modal — the alert's text
+            // field appears focused (cursor blinks) but typing doesn't reach
+            // it. Returning from the Button action first frees up the event
+            // stack so runModal starts with a clean responder chain.
+            Task { @MainActor in
+                if let result = NewCollectionPrompt.show(kind: kind) {
+                    lib.addCollection(name: result.name, kind: kind, colorHex: result.color)
+                }
             }
         } label: { Image(systemName: "plus") }
             .buttonStyle(.plain)
