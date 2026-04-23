@@ -48,9 +48,44 @@ final class FontLibrary: ObservableObject {
     @Published var previewSize: Double = 36
 
     // MARK: - Selection
+
     @Published var sidebarSelection: SidebarItem = .allFonts
-    @Published var searchQuery: String = ""
     @Published var selectedFontID: String? = nil
+
+    /// What the user is currently typing. Bound to the search text field so
+    /// every keystroke only updates this one tiny string — no derived data
+    /// is recomputed. Fast to redraw.
+    @Published var searchInput: String = ""
+
+    /// What the family list actually filters on. Updated from `searchInput`
+    /// after a short debounce so that 45 000 fonts aren't re-scanned on
+    /// every keystroke.
+    @Published private(set) var searchQuery: String = ""
+
+    private var searchDebounceTask: Task<Void, Never>?
+
+    /// Called from the search TextField's `onChange`. Stores the keystroke
+    /// immediately and schedules a debounced commit to `searchQuery`.
+    func updateSearchInput(_ text: String) {
+        searchInput = text
+        searchDebounceTask?.cancel()
+        searchDebounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 180_000_000)  // 180ms
+            guard !Task.isCancelled, self.searchInput == text else { return }
+            if self.searchQuery != text {
+                self.searchQuery = text
+                self.invalidateDerivedViews()
+            }
+        }
+    }
+
+    /// Invalidate only the per-selection caches that depend on `searchQuery`
+    /// or `sidebarSelection` — not the heavy `derivedVersion` counter that
+    /// gates the whole library.
+    fileprivate func invalidateDerivedViews() {
+        currentItemsCache = nil
+        familyGroupsCache = nil
+    }
 
     private let activator = FontActivator()
 
@@ -104,10 +139,40 @@ final class FontLibrary: ObservableObject {
 
     // MARK: - Derived data
 
+    /// Cache of the last `currentItems()` result, keyed by the inputs that
+    /// produced it. With 45 000+ fonts, re-filtering on every SwiftUI render
+    /// is the difference between smooth and unusable.
+    fileprivate var currentItemsCache: (derivedVersion: Int,
+                                        selection: SidebarItem,
+                                        query: String,
+                                        activeVer: Int,
+                                        favVer: Int,
+                                        result: [FontItem])? = nil
+
+    fileprivate var familyGroupsCache: (derivedVersion: Int,
+                                        selection: SidebarItem,
+                                        query: String,
+                                        activeVer: Int,
+                                        favVer: Int,
+                                        result: [FontFamilyGroup])? = nil
+
+    /// Bumps each time `activeFontIDs` or `favorites` changes so the view
+    /// caches know to recompute for selections that depend on them.
+    fileprivate var activeVersion: Int = 0
+    fileprivate var favoritesVersion: Int = 0
+
     var familyGroups: [FontFamilyGroup] {
+        if let c = familyGroupsCache,
+           c.derivedVersion == derivedVersion,
+           c.selection == sidebarSelection,
+           c.query == searchQuery,
+           c.activeVer == activeVersion,
+           c.favVer == favoritesVersion {
+            return c.result
+        }
         let filtered = currentItems()
         let grouped = Dictionary(grouping: filtered, by: { $0.familyKey })
-        return grouped
+        let result = grouped
             .map { key, faces in
                 FontFamilyGroup(
                     key: key,
@@ -116,9 +181,20 @@ final class FontLibrary: ObservableObject {
                 )
             }
             .sorted { $0.name.lowercased() < $1.name.lowercased() }
+        familyGroupsCache = (derivedVersion, sidebarSelection, searchQuery,
+                             activeVersion, favoritesVersion, result)
+        return result
     }
 
     func currentItems() -> [FontItem] {
+        if let c = currentItemsCache,
+           c.derivedVersion == derivedVersion,
+           c.selection == sidebarSelection,
+           c.query == searchQuery,
+           c.activeVer == activeVersion,
+           c.favVer == favoritesVersion {
+            return c.result
+        }
         let q = searchQuery.trimmingCharacters(in: .whitespaces).lowercased()
         let scope: [FontItem]
         switch sidebarSelection {
@@ -150,12 +226,19 @@ final class FontLibrary: ObservableObject {
             // but return all so the fallback is sensible if ever visible.
             scope = items
         }
-        if q.isEmpty { return scope }
-        return scope.filter {
-            $0.familyName.lowercased().contains(q) ||
-            $0.styleName.lowercased().contains(q) ||
-            $0.postScriptName.lowercased().contains(q)
+        let filtered: [FontItem]
+        if q.isEmpty {
+            filtered = scope
+        } else {
+            filtered = scope.filter {
+                $0.familyName.lowercased().contains(q) ||
+                $0.styleName.lowercased().contains(q) ||
+                $0.postScriptName.lowercased().contains(q)
+            }
         }
+        currentItemsCache = (derivedVersion, sidebarSelection, searchQuery,
+                             activeVersion, favoritesVersion, filtered)
+        return filtered
     }
 
     var categoryCounts: [(FontCategory, Int)] {
@@ -221,6 +304,7 @@ final class FontLibrary: ObservableObject {
     func toggleFavorite(_ item: FontItem) {
         if favorites.contains(item.id) { favorites.remove(item.id) }
         else { favorites.insert(item.id) }
+        favoritesVersion &+= 1
         invalidateDerived()
         persist()
     }
@@ -237,6 +321,8 @@ final class FontLibrary: ObservableObject {
             try? await activator.deactivate([item])
             activeFontIDs.remove(item.id)
         }
+        activeVersion &+= 1
+        invalidateDerivedViews()
         persist()
     }
 
@@ -248,6 +334,8 @@ final class FontLibrary: ObservableObject {
             try? await activator.deactivate(items)
             activeFontIDs.subtract(items.map { $0.id })
         }
+        activeVersion &+= 1
+        invalidateDerivedViews()
         persist()
     }
 
@@ -710,6 +798,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
     case orphans
     case missingRefs
     case largeFiles
+    case fork
 
     var id: String { rawValue }
     var label: String {
@@ -720,6 +809,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
         case .orphans:     return "Orphan Files"
         case .missingRefs: return "Missing References"
         case .largeFiles:  return "Largest Files"
+        case .fork:        return "Fork (UFO / Designspace)"
         }
     }
     var icon: String {
@@ -730,6 +820,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
         case .orphans:     return "doc.badge.ellipsis"
         case .missingRefs: return "link.badge.plus"
         case .largeFiles:  return "arrow.up.arrow.down.circle"
+        case .fork:        return "arrow.triangle.branch"
         }
     }
     var tint: Color {
@@ -740,6 +831,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
         case .orphans:     return .gray
         case .missingRefs: return .indigo
         case .largeFiles:  return .blue
+        case .fork:        return .mint
         }
     }
 }

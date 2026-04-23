@@ -149,6 +149,10 @@ struct SidebarView: View {
                      title: ToolKind.largeFiles.label,
                      icon: ToolKind.largeFiles.icon,
                      tint: ToolKind.largeFiles.tint)
+            rowLabel(.tool(.fork),
+                     title: ToolKind.fork.label,
+                     icon: ToolKind.fork.icon,
+                     tint: ToolKind.fork.tint)
         }
     }
 

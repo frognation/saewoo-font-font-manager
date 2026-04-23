@@ -14,6 +14,7 @@ struct ContentView: View {
         case .tool(.orphans):     OrphansView()
         case .tool(.missingRefs): MissingRefsView()
         case .tool(.largeFiles):  LargeFilesView()
+        case .tool(.fork):        ForkView()
         default:                  FontListView()
         }
     }
@@ -61,7 +62,13 @@ struct TopToolbar: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField("Search family, style, postscript…", text: $lib.searchQuery)
+            // Bind to searchInput (instant, cheap) and debounce to searchQuery
+            // via updateSearchInput so filtering doesn't fire on every key.
+            TextField("Search family, style, postscript…",
+                      text: Binding(
+                          get: { lib.searchInput },
+                          set: { lib.updateSearchInput($0) }
+                      ))
                 .textFieldStyle(.plain)
             Spacer()
             Slider(value: $lib.previewSize, in: 12...96)
