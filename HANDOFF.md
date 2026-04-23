@@ -1,7 +1,160 @@
 # Handoff Notes
 
-Session notes for picking this project back up in a new tool / new agent session.
-Current branch: `main`. Last commit is the big 6-turn iteration summarized below.
+Rolling notes for picking this project back up in a new agent / new machine.
+Sessions are appended in reverse chronological order at the top. For the
+one-paste session-start prompt, see `NEXT_SESSION.md`.
+
+**Current branch: `work/compB-20260422`** (8 commits ahead of `main`).
+Do not land on `main` directly — see "Cross-machine workflow" at the bottom.
+
+---
+
+## Session 2 — 2026-04-23 (compB)
+
+Started from `main` @ `cb3abb4` (Session 1 end), branched to
+`work/compB-20260422` to keep new work isolated from any potentially
+unpushed Session 1 work on the other machine. Commits pushed in order:
+
+| Commit     | Summary |
+|------------|---------|
+| `120551e`  | `DuplicatesView` — new "Minimize system folders" Keep strategy + `SystemFontGuard` (essentials + SIP-locked protection). Protected badges in UI, checkboxes disabled for essentials, location badges (`/System` · `/Library` · `~/Library` · Custom). |
+| `20f41e3`  | Drop unused `import AppKit` from `FontScanner`. (Pure cleanup; was not the Xcode build-error fix — that one was a build-destination issue in Xcode's scheme picker.) |
+| `16caeec`  | Attempt to fix New Project/Palette name-field input by wrapping `NewCollectionPrompt.show()` in `Task { @MainActor }` + explicit `makeFirstResponder`. **Did not work.** |
+| `792ceb9`  | Replace `NSAlert` entirely with a bespoke `NSWindow` + `NSApp.runModal(for:)`. **Still did not work.** |
+| `e8310fe`  | Attach prompt as AppKit **sheet** to the SwiftUI host window via `parent.beginSheet(window, completionHandler:)`. Made `show` async. **Still did not work** — because the real cause was elsewhere. |
+| `197a73d`  | **`.rightfontlibrary` import** — new `RightFontImporter` service parses `manifest.rightfontmetadata`, per-font metadata, and fontlists. `FontScanner` descends into `.rightfontlibrary` packages transparently. Sidebar picker accepts both folders and `.rightfontlibrary` bundles. Right-click source → "Import RightFont Collections as Palettes" creates Palettes from each non-empty fontlist, auto-favorites starred fonts. |
+| `9a74015`  | **THE real input fix + perf pass + Fork tool.** See details below. |
+| `96445ac`  | System-active scan + Adobe Fonts local cache auto-detection. See details below. |
+
+### 5. Keyboard input — root cause finally identified (commit `9a74015`)
+
+All five earlier sheet-focused attempts failed because the SwiftUI input
+bug was **app-wide**, not sheet-specific. Symptom: search box AND every
+NSTextField showed a blinking cursor but keyboard events never landed.
+
+Root cause: SwiftUI `@main App` compiled as an **SPM executable** (not a
+proper `.app` bundle) runs with no activation policy set, so macOS never
+treats the process as a real foreground app. Windows are visible, the
+cursor blinks, but key events are dropped.
+
+Fix: `@NSApplicationDelegateAdaptor(AppDelegate.self)` in
+`SaewooFontApp.swift`, with the delegate calling
+`NSApp.setActivationPolicy(.regular)` and `NSApp.activate(ignoringOtherApps: true)`
+in `applicationDidFinishLaunching`.
+
+Keeping the sheet-based NewCollectionPrompt because it's still the most
+robust native-looking dialog — only now it actually accepts keyboard input.
+
+### 6. Performance pass (commit `9a74015`)
+
+For libraries with 45k+ faces the previous code was recomputing every
+derived view on every SwiftUI render. Three changes:
+
+- **Search is debounced (180 ms).** `searchInput` (the text-field
+  binding) and `searchQuery` (what filtering uses) are now separate.
+  Typing is instant even at 45k items.
+- **`currentItems()` and `familyGroups` cache** by
+  `(derivedVersion, sidebarSelection, searchQuery, activeVersion, favoritesVersion)`.
+  Previously they re-iterated the whole library on every render.
+- **`setActive*` and `toggleFavorite` bump lightweight version counters**
+  (`activeVersion`, `favoritesVersion`) that invalidate only the view
+  caches, not the expensive library-wide caches.
+
+FontPreviewCache was already bounded by `NSCache(countLimit: 1000)`.
+
+### 7. Fork tool — UFO / Designspace exporter (commit `9a74015`)
+
+New tool sidebar entry under Tools. Turns existing fonts into
+Glyphs.app / RoboFont-openable sources. License / copyright / trademark
+are always stripped; unitsPerEm, ascender, descender, capHeight,
+xHeight, italic angle, underline position/thickness are preserved.
+
+Three scenarios, auto-detected from source selection:
+
+- **Single static font → UFO 3** (`.ufo`) — one file, glyph outlines
+  extracted via `CTFontCreatePathForGlyph` + `CGPath.applyWithBlock`.
+  Glyph names come from `CGFont.name(for:)`, with `uni{HEX}` fallback.
+- **Single variable font → Designspace** (`.designspace-output/` folder
+  with `.designspace` + N UFO masters). Named instances parsed from
+  the `fvar` table directly; if none exist we synthesise masters at
+  each axis's min/default/max.
+- **Multiple static styles → Designspace** — one UFO per style, with a
+  Weight axis (100..900) inferred from each style's `kCTFontWeightTrait`.
+
+Three orthogonal glyph modes:
+
+- **Full** — all outlines in the default layer.
+- **Empty** — font info + metrics only (single `.notdef`).
+- **Background** — originals on `public.background` layer, default
+  layer empty. Default mode — most useful for "forking to trace / start
+  a new design with reference".
+
+Optional "Reset identity" blanks familyName/styleName/postscriptFontName
+so the fork is a clean starting point.
+
+Source modes:
+- Selected font
+- All styles in selected font's family
+- Current list in main pane (filter/collection/etc.)
+
+Files:
+- `Sources/SaewooFont/Services/UFOExporter.swift` (all writers +
+  fvar parser + CGPath-to-GLIF converter + designspace XML writer)
+- `Sources/SaewooFont/Views/ForkView.swift`
+- `ToolKind.fork` added to `FontLibrary.swift`, wired in
+  `ContentView` and `SidebarView` Tools section.
+
+### 8. System-active scan + Adobe Fonts cache (commit `96445ac`)
+
+Answers the question "do fonts activated by OTHER managers
+(RightFont / FontBase / Typeface / Adobe CC) show up?" — now **yes**,
+when the toggle is on.
+
+- `FontScanner.scanAvailableInSystem(excluding:)` uses
+  `CTFontCollectionCreateFromAvailableFonts` to enumerate every font
+  CoreText currently knows about, regardless of filesystem location.
+- `LibraryState.includeSystemActive` (default **on**) controls whether
+  `rescan()` merges that enumeration with the filesystem walk. Toggle
+  exposed in sidebar Sources section as "Other managers + Adobe CC".
+- `FontScanner.adobeFontsCacheURL` detects
+  `~/Library/Application Support/Adobe/CoreSync/plugins/livetype/.r/`
+  and includes it in `defaultSearchRoots` when present.
+- Scan status shows `"45 000 faces · +231 from other managers"`.
+
+---
+
+## Queued for the next session
+
+Explicit user requests, in priority order:
+
+1. **Duplicates tool — backup-before-delete system.**
+   User wants deleted files sent to a reversible backup location so
+   mistakes can be undone. Design the safest + most sensible approach
+   (Trash works but not atomic with our state; consider a versioned
+   snapshot under `~/Library/Application Support/SaewooFont/DuplicateBackups/{timestamp}/`
+   with a `manifest.json` recording original paths for easy restore).
+
+2. **Duplicates tool — list filters** (path / name / size sort).
+   The full-list view should let users sort or filter by file path, by
+   filename alphabetically, and by size.
+
+3. **Duplicates tool — per-source delete-lock.**
+   User wants to mark certain sources as "never delete from here,
+   regardless of Keep strategy". Lock status is orthogonal to Keep
+   priority. Either add per-source lock toggles, or propose a broader
+   options system that captures the same idea.
+
+4. **Google Fonts connector.**
+   Mirror RightFont's connected-catalog feature. Plan:
+   - Catalog fetch: `https://fonts.google.com/metadata/fonts`
+     (undocumented but public, JSON with a `)]}'` XSS prefix; free).
+   - Download: TTFs to
+     `~/Library/Application Support/SaewooFont/GoogleFonts/`
+     cache, add that dir as a source.
+   - Browser UI: Tools section entry "Google Fonts" with search,
+     per-family install / remove.
+
+5. (Already shipped — Adobe Fonts local read is live.)
 
 ---
 
