@@ -454,6 +454,104 @@ final class FontLibrary: ObservableObject {
         persist()
     }
 
+    // MARK: - RightFont library import
+
+    /// Result of a RightFont library import, surfaced to the user as a summary.
+    struct RightFontImportReport {
+        var libraryName: String
+        var paletteCount: Int          // number of Palettes created
+        var skippedCount: Int          // fontlists skipped (empty, no resolvable fonts, etc.)
+        var starredMatchCount: Int     // fonts flagged starred in RightFont that we favorited
+        var enrichedCount: Int         // fonts we matched to a RightFont metadata record
+    }
+
+    /// Imports collections + per-font metadata from a `.rightfontlibrary`
+    /// package that's already been added as a scan path. Creates Palettes
+    /// named after each RightFont "fontlist" and auto-favorites any fonts
+    /// RightFont had starred. Safe to re-run — existing palettes with the
+    /// same name under the same library are updated, not duplicated.
+    @discardableResult
+    func importRightFontLibrary(_ bundle: URL) async -> RightFontImportReport? {
+        guard RightFontImporter.isLibrary(bundle) else { return nil }
+
+        let manifest = RightFontImporter.parseManifest(in: bundle)
+        let libName = manifest?.name ?? bundle.deletingPathExtension().lastPathComponent
+
+        // Build lookup: hyphen-less UUID → RightFont font entry.
+        let entries = await RightFontImporter.parseAllFontEntries(in: bundle)
+
+        // Index our own items by absolute URL for quick resolution.
+        let itemsByPath: [String: FontItem] = Dictionary(
+            uniqueKeysWithValues: items.map {
+                ($0.fileURL.standardizedFileURL.path, $0)
+            }
+        )
+
+        // UUID → FontItem.id (ours). We resolve by absolute path so rescans
+        // that regenerate our IDs still work correctly.
+        var uuidToOurID: [String: String] = [:]
+        var starredMatches = 0
+        var enriched = 0
+        for (hyphenless, entry) in entries {
+            guard let loc = entry.location else { continue }
+            let url = RightFontImporter.resolve(location: loc, in: bundle)
+                .standardizedFileURL
+            if let ours = itemsByPath[url.path] {
+                uuidToOurID[hyphenless] = ours.id
+                enriched += 1
+                if entry.starred == true, !favorites.contains(ours.id) {
+                    favorites.insert(ours.id)
+                    starredMatches += 1
+                }
+            }
+        }
+
+        // Fontlists → Palettes.
+        let lists = RightFontImporter.parseAllFontLists(in: bundle)
+        var created = 0
+        var skipped = 0
+        // Tag imported palettes with a prefix so they're grouped visually.
+        let palettePrefix = "[\(libName)] "
+
+        for list in lists {
+            guard let name = list.name, let fonts = list.fonts, !fonts.isEmpty else {
+                skipped += 1; continue
+            }
+            let mappedIDs: Set<String> = Set(fonts.compactMap { uuidToOurID[$0.uppercased()] })
+            guard !mappedIDs.isEmpty else { skipped += 1; continue }
+
+            let paletteName = palettePrefix + name
+            if let existingIdx = collections.firstIndex(where: {
+                $0.kind == .palette && $0.name == paletteName
+            }) {
+                collections[existingIdx].fontIDs = mappedIDs
+            } else {
+                collections.append(FontCollection(
+                    name: paletteName, kind: .palette,
+                    colorHex: Self.rotatingPaletteColor(seed: collections.count),
+                    fontIDs: mappedIDs
+                ))
+            }
+            created += 1
+        }
+
+        persist()
+
+        return RightFontImportReport(
+            libraryName: libName,
+            paletteCount: created,
+            skippedCount: skipped,
+            starredMatchCount: starredMatches,
+            enrichedCount: enriched
+        )
+    }
+
+    private static func rotatingPaletteColor(seed: Int) -> String {
+        let palette = ["#7DD3FC", "#A78BFA", "#F472B6", "#FB923C",
+                       "#FACC15", "#4ADE80", "#22D3EE", "#F87171"]
+        return palette[abs(seed) % palette.count]
+    }
+
     // MARK: - Persistence helper
 
     private func persist() {

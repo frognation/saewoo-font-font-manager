@@ -78,7 +78,15 @@ enum FontScanner {
     private static func collectFiles(in roots: [URL]) -> [URL] {
         let fm = FileManager.default
         var files: [URL] = []
-        for root in roots {
+        for rawRoot in roots {
+            // If the root is a `.rightfontlibrary` package, transparently
+            // descend into its `fonts/` subdirectory instead — that's where
+            // the actual font files live, and the rest of the package is
+            // metadata we consume separately.
+            let root = RightFontImporter.isLibrary(rawRoot)
+                ? RightFontImporter.fontsRoot(in: rawRoot)
+                : rawRoot
+
             guard let it = fm.enumerator(
                 at: root,
                 includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .creationDateKey],

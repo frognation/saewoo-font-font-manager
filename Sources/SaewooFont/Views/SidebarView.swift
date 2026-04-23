@@ -282,11 +282,24 @@ struct SidebarView: View {
     @ViewBuilder
     private func sourceRow(_ url: URL, removable: Bool) -> some View {
         let count = lib.itemsInSource(url).count
-        let label = removable ? url.lastPathComponent : FontLibrary.label(for: url)
+        let isRFLibrary = RightFontImporter.isLibrary(url)
+        // RightFont libraries get a briefcase icon + purple tint so they
+        // stand out from plain folders at a glance.
+        let icon = isRFLibrary
+            ? "briefcase.fill"
+            : (removable ? "folder.badge.plus" : "folder")
+        let tint: Color = isRFLibrary ? .purple : .blue
+        // Strip the ".rightfontlibrary" suffix from the display label —
+        // users don't need to see the extension in the sidebar.
+        let label: String = {
+            if isRFLibrary { return url.deletingPathExtension().lastPathComponent }
+            return removable ? url.lastPathComponent : FontLibrary.label(for: url)
+        }()
+
         HStack(spacing: 10) {
-            Image(systemName: removable ? "folder.badge.plus" : "folder")
+            Image(systemName: icon)
                 .font(.system(size: 14))
-                .foregroundStyle(.blue)
+                .foregroundStyle(tint)
                 .frame(width: 20)
             Text(label).font(.system(size: 13)).lineLimit(1)
             Spacer(minLength: 4)
@@ -312,6 +325,16 @@ struct SidebarView: View {
             Button("Deactivate All in Folder") {
                 Task { await lib.setActiveMany(lib.itemsInSource(url), active: false) }
             }
+            if isRFLibrary {
+                Divider()
+                Button("Import RightFont Collections as Palettes") {
+                    Task { @MainActor in
+                        if let report = await lib.importRightFontLibrary(url) {
+                            presentImportReport(report)
+                        }
+                    }
+                }
+            }
             Divider()
             if removable {
                 Button("Remove from Sources", role: .destructive) {
@@ -321,6 +344,21 @@ struct SidebarView: View {
                 Button("Hide from Sidebar") { lib.hideDefaultSource(url) }
             }
         }
+    }
+
+    /// Shows a small success alert summarising what the RightFont import did.
+    @MainActor
+    private func presentImportReport(_ r: FontLibrary.RightFontImportReport) {
+        let alert = NSAlert()
+        alert.messageText = "Imported “\(r.libraryName)”"
+        alert.informativeText = """
+        \(r.paletteCount) palette\(r.paletteCount == 1 ? "" : "s") created.
+        \(r.enrichedCount) font\(r.enrichedCount == 1 ? "" : "s") matched to RightFont metadata.
+        \(r.starredMatchCount) starred font\(r.starredMatchCount == 1 ? "" : "s") added to Favorites.
+        \(r.skippedCount == 0 ? "" : "\(r.skippedCount) empty/unresolved fontlist\(r.skippedCount == 1 ? "" : "s") skipped.")
+        """
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     private var hiddenSourcesMenu: some View {
@@ -447,10 +485,28 @@ struct SidebarView: View {
     private func pickFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
-        panel.canChooseFiles = false
+        // Also allow picking `.rightfontlibrary` packages. Packages are files
+        // to the Finder, so we flip canChooseFiles on AND ensure packages
+        // aren't traversed as if they were folders.
+        panel.canChooseFiles = true
+        panel.treatsFilePackagesAsDirectories = false
         panel.allowsMultipleSelection = false
-        panel.title = "Choose a folder to scan for fonts"
+        panel.title = "Choose a folder or a .rightfontlibrary package to scan"
+        panel.message = "You can select a regular folder OR a RightFont library package (.rightfontlibrary)."
         if panel.runModal() == .OK, let url = panel.url {
+            // Validate: if it's a file, it must be a .rightfontlibrary — we
+            // don't want to accept arbitrary non-folder files.
+            var isDir: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+            let isFolder = exists && isDir.boolValue
+            let isLibrary = RightFontImporter.isLibrary(url)
+            guard isFolder || isLibrary else {
+                let a = NSAlert()
+                a.messageText = "Unsupported selection"
+                a.informativeText = "Pick a folder or a .rightfontlibrary package."
+                a.runModal()
+                return
+            }
             lib.addCustomScanPath(url)
         }
     }
