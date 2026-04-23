@@ -1,6 +1,5 @@
 import Foundation
 import CoreText
-import AppKit
 
 enum FontScanner {
     static let defaultSearchRoots: [URL] = {
