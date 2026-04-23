@@ -62,10 +62,16 @@ struct LibraryState: Codable {
     /// Default scan-root paths the user has hidden from the sidebar.
     /// Stored as raw path strings so JSON round-trips cleanly across machines.
     var hiddenDefaultSources: Set<String> = []
+    /// When true, also enumerate every font currently registered with
+    /// Core Text (including those activated by other font managers like
+    /// RightFont, FontBase, Typeface, Adobe CC). Default on — users
+    /// generally want to see everything that's actually available.
+    var includeSystemActive: Bool = true
 
     private enum CodingKeys: String, CodingKey {
         case favorites, collections, activeFontIDs, customScanPaths
         case userText, previewSize, variableInstances, hiddenDefaultSources
+        case includeSystemActive
     }
 
     init() {}
@@ -74,7 +80,8 @@ struct LibraryState: Codable {
          activeFontIDs: Set<String>, customScanPaths: [URL],
          userText: String, previewSize: Double,
          variableInstances: [VariableInstance] = [],
-         hiddenDefaultSources: Set<String> = []) {
+         hiddenDefaultSources: Set<String> = [],
+         includeSystemActive: Bool = true) {
         self.favorites = favorites
         self.collections = collections
         self.activeFontIDs = activeFontIDs
@@ -83,6 +90,7 @@ struct LibraryState: Codable {
         self.previewSize = previewSize
         self.variableInstances = variableInstances
         self.hiddenDefaultSources = hiddenDefaultSources
+        self.includeSystemActive = includeSystemActive
     }
 
     init(from decoder: Decoder) throws {
@@ -95,5 +103,6 @@ struct LibraryState: Codable {
         self.previewSize      = (try? c.decode(Double.self,             forKey: .previewSize))      ?? 36
         self.variableInstances = (try? c.decode([VariableInstance].self, forKey: .variableInstances)) ?? []
         self.hiddenDefaultSources = (try? c.decode(Set<String>.self,    forKey: .hiddenDefaultSources)) ?? []
+        self.includeSystemActive = (try? c.decode(Bool.self,            forKey: .includeSystemActive)) ?? true
     }
 }

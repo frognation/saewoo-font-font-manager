@@ -9,6 +9,14 @@ enum FontScanner {
             roots.append(user.appendingPathComponent("Fonts"))
         }
         roots.append(URL(fileURLWithPath: "/Library/Fonts"))
+        // Adobe Fonts' local sync cache. Present only if the user has an
+        // active Adobe CC subscription with Adobe Fonts enabled and
+        // Creative Cloud has synced at least one font. Adding it as a
+        // default root lets users see their Adobe Fonts alongside their
+        // own library without extra setup.
+        if let adobe = Self.adobeFontsCacheURL {
+            roots.append(adobe)
+        }
         return roots
     }()
 
@@ -99,6 +107,53 @@ enum FontScanner {
             }
         }
         return files
+    }
+
+    /// Enumerates every font currently known to Core Text — including those
+    /// registered by OTHER font managers (RightFont, FontBase, Typeface,
+    /// Adobe CC's font daemon) via CTFontManager `.session` or `.user`
+    /// scope. Filesystem walks miss those because the files can live
+    /// outside our scan paths.
+    ///
+    /// We de-dupe against any items we already have by absolute file URL,
+    /// so calling this alongside `scanParallel` doesn't produce duplicates.
+    static func scanAvailableInSystem(excluding knownURLs: Set<URL>) -> [FontItem] {
+        let collection = CTFontCollectionCreateFromAvailableFonts(nil)
+        guard let descs = CTFontCollectionCreateMatchingFontDescriptors(collection)
+                as? [CTFontDescriptor] else { return [] }
+        var items: [FontItem] = []
+        items.reserveCapacity(descs.count)
+        for desc in descs {
+            guard let url = CTFontDescriptorCopyAttribute(desc, kCTFontURLAttribute) as? URL
+            else { continue }
+            let std = url.standardizedFileURL
+            if knownURLs.contains(std) { continue }
+            let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .creationDateKey]))
+            let size = Int64((attrs?.fileSize) ?? 0)
+            let created = attrs?.creationDate ?? Date()
+            if let item = buildItem(from: desc, url: url, fileSize: size, dateAdded: created) {
+                items.append(item)
+            }
+        }
+        return items
+    }
+
+    // MARK: - Adobe Fonts local cache
+
+    /// The path where Adobe CC's font-sync daemon stages Adobe-Fonts-synced
+    /// files locally. If the user has an active Adobe subscription with
+    /// Adobe Fonts enabled, fonts they've activated will be readable here.
+    /// The `.r` subfolder contains the actual TTF/OTF files (numerically
+    /// named). Returns nil if the directory doesn't exist.
+    static var adobeFontsCacheURL: URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let path = home.appendingPathComponent(
+            "Library/Application Support/Adobe/CoreSync/plugins/livetype/.r",
+            isDirectory: true
+        )
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: path.path, isDirectory: &isDir)
+        return (exists && isDir.boolValue) ? path : nil
     }
 
     /// A single file may contain multiple faces (TTC/OTC). Expand into one FontItem per face.

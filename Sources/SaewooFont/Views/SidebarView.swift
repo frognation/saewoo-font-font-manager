@@ -61,7 +61,39 @@ struct SidebarView: View {
                 sourceRow(url, removable: true)
             }
             if hasAutoOrManuallyHidden { hiddenSourcesMenu }
+            systemActiveToggleRow
         }
+    }
+
+    /// Toggles "include fonts activated by other font managers" (RightFont,
+    /// FontBase, Typeface, Adobe CC…). When on, rescan merges every font
+    /// CoreText currently knows about, even those whose files live outside
+    /// our scan paths.
+    private var systemActiveToggleRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: lib.includeSystemActive
+                  ? "dot.radiowaves.left.and.right"
+                  : "dot.radiowaves.left.and.right")
+                .font(.system(size: 14))
+                .foregroundStyle(lib.includeSystemActive ? .green : .secondary)
+                .frame(width: 20)
+            Toggle(isOn: Binding(
+                get: { lib.includeSystemActive },
+                set: { lib.setIncludeSystemActive($0) }
+            )) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Other managers + Adobe CC")
+                        .font(.system(size: 12))
+                    Text("RightFont, FontBase, Typeface, …")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+        }
+        .padding(.vertical, 3)
+        .help("When on, rescan also enumerates every font CoreText currently knows about — so fonts activated by other managers show up in this library too.")
     }
 
     @ViewBuilder

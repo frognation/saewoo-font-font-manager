@@ -40,6 +40,9 @@ final class FontLibrary: ObservableObject {
     @Published var customScanPaths: [URL] = []
     @Published var variableInstances: [VariableInstance] = []
     @Published var hiddenDefaultSources: Set<String> = []
+    /// When true, rescan merges every font CoreText currently knows about —
+    /// catches fonts activated by other managers (RightFont, FontBase, Adobe CC).
+    @Published var includeSystemActive: Bool = true
     /// Files with font extensions that Core Text couldn't read — populated each scan.
     /// Not cached to disk; rebuilt from the current scan.
     @Published private(set) var orphanURLs: [URL] = []
@@ -99,6 +102,7 @@ final class FontLibrary: ObservableObject {
         self.customScanPaths = state.customScanPaths
         self.variableInstances = state.variableInstances
         self.hiddenDefaultSources = state.hiddenDefaultSources
+        self.includeSystemActive = state.includeSystemActive
         self.previewText = state.userText.isEmpty ? previewText : state.userText
         self.previewSize = state.previewSize > 0 ? state.previewSize : previewSize
 
@@ -121,9 +125,25 @@ final class FontLibrary: ObservableObject {
         scanStatus = "Scanning fonts…"
         let roots = visibleDefaultSources + customScanPaths
         let result = await FontScanner.scanParallel(roots: roots)
+        var merged = result.items
+
+        // Optional: ask Core Text for every font currently registered with
+        // the OS and merge in anything we haven't seen. This catches fonts
+        // activated by other managers (RightFont, FontBase, Typeface, Adobe
+        // CC's font daemon) even when their files live outside our scan
+        // paths.
+        if includeSystemActive {
+            scanStatus = "Merging system-active fonts…"
+            let knownURLs = Set(merged.map { $0.fileURL.standardizedFileURL })
+            let extra = await Task.detached(priority: .userInitiated) {
+                FontScanner.scanAvailableInSystem(excluding: knownURLs)
+            }.value
+            // Rebuild ids against the merged set to keep them stable.
+            merged.append(contentsOf: extra)
+        }
 
         // Sort by family then style for stable listing
-        self.items = result.items.sorted {
+        self.items = merged.sorted {
             if $0.familyName.lowercased() == $1.familyName.lowercased() {
                 return $0.styleName < $1.styleName
             }
@@ -131,8 +151,10 @@ final class FontLibrary: ObservableObject {
         }
         invalidateDerived()
         self.orphanURLs = result.orphanURLs
+        let systemExtra = max(0, merged.count - result.items.count)
         scanStatus = "\(items.count) faces across \(Set(items.map{$0.familyKey}).count) families"
-        + (result.orphanURLs.isEmpty ? "" : " · \(result.orphanURLs.count) orphan\(result.orphanURLs.count == 1 ? "" : "s")")
+            + (systemExtra > 0 ? " · +\(systemExtra) from other managers" : "")
+            + (result.orphanURLs.isEmpty ? "" : " · \(result.orphanURLs.count) orphan\(result.orphanURLs.count == 1 ? "" : "s")")
         isScanning = false
         Persistence.saveCachedLibrary(items)
     }
@@ -651,9 +673,18 @@ final class FontLibrary: ObservableObject {
             userText: previewText,
             previewSize: previewSize,
             variableInstances: variableInstances,
-            hiddenDefaultSources: hiddenDefaultSources
+            hiddenDefaultSources: hiddenDefaultSources,
+            includeSystemActive: includeSystemActive
         )
         Persistence.saveState(state)
+    }
+
+    /// Call when the user flips `includeSystemActive` from the UI.
+    func setIncludeSystemActive(_ enabled: Bool) {
+        guard enabled != includeSystemActive else { return }
+        includeSystemActive = enabled
+        persist()
+        Task { await rescan() }
     }
 
     // MARK: - Sources visibility
