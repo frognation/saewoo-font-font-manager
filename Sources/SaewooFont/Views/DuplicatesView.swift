@@ -3,26 +3,31 @@ import AppKit
 
 /// How to pick the "winner" from each duplicate group when bulk-selecting extras.
 enum KeepStrategy: String, CaseIterable, Identifiable {
-    case composite   // favorited > active > user-folder > newest
-    case newest      // latest dateAdded
-    case userFolder  // anything inside ~/Library/Fonts wins
-    case largest     // biggest file size (often most feature-complete)
+    case composite        // favorited > active > user-folder > newest
+    case newest           // latest dateAdded
+    case userFolder       // anything inside ~/Library/Fonts wins
+    case largest          // biggest file size (often most feature-complete)
+    case minimizeSystem   // prefer to REMOVE copies under /Library or /System/Library,
+                          // keeping whatever lives in ~/Library/Fonts or custom paths.
+                          // Never targets essential macOS UI fonts.
 
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .composite:  return "Smart — keep favorite/active/newest"
-        case .newest:     return "Keep the newest"
-        case .userFolder: return "Keep the one in ~/Library/Fonts"
-        case .largest:    return "Keep the largest file"
+        case .composite:      return "Smart — keep favorite/active/newest"
+        case .newest:         return "Keep the newest"
+        case .userFolder:     return "Keep the one in ~/Library/Fonts"
+        case .largest:        return "Keep the largest file"
+        case .minimizeSystem: return "Minimize system folders (remove /Library & /System copies)"
         }
     }
     var shortLabel: String {
         switch self {
-        case .composite:  return "Smart"
-        case .newest:     return "Newest"
-        case .userFolder: return "User folder"
-        case .largest:    return "Largest"
+        case .composite:      return "Smart"
+        case .newest:         return "Newest"
+        case .userFolder:     return "User folder"
+        case .largest:        return "Largest"
+        case .minimizeSystem: return "Minimize system"
         }
     }
     var explanation: String {
@@ -35,6 +40,8 @@ enum KeepStrategy: String, CaseIterable, Identifiable {
             return "Keeps the copy inside ~/Library/Fonts over any system or vendor-installed copies."
         case .largest:
             return "Keeps the bigger file — usually the one with more OpenType features or language coverage."
+        case .minimizeSystem:
+            return "Targets duplicates in /Library/Fonts (and /System/Library/Fonts, though SIP usually blocks those) for removal. Always keeps essential macOS fonts — SF Pro, Helvetica, emoji, CJK — even if they look like extras."
         }
     }
 }
@@ -166,9 +173,13 @@ struct DuplicatesView: View {
             Button {
                 selectAllExtras(groups: groups)
             } label: {
-                Label("Select Extras (\(allExtrasCount(groups)))", systemImage: "checkmark.circle")
+                // Show deletable count — protected files are excluded from
+                // bulk selection so the number reflects what will actually go.
+                Label("Select Extras (\(deletableExtrasCount(groups)))",
+                      systemImage: "checkmark.circle")
             }
-            .disabled(allExtrasCount(groups) == 0)
+            .disabled(deletableExtrasCount(groups) == 0)
+            .help("Selects every non-winner file that is safe to delete. Essential macOS fonts and SIP-locked files are skipped.")
 
             Button {
                 selection.removeAll()
@@ -214,29 +225,64 @@ struct DuplicatesView: View {
         case .largest:
             return group.max { $0.fileSize < $1.fileSize } ?? group[0]
         case .userFolder:
-            if let u = group.first(where: { $0.fileURL.path.contains("/Library/Fonts") &&
-                                            $0.fileURL.path.hasPrefix(NSHomeDirectory()) }) { return u }
+            if let u = group.first(where: { SystemFontGuard.isInUserFolder($0.fileURL) }) { return u }
             // fall through to newest as tiebreaker
             return group.max { $0.dateAdded < $1.dateAdded } ?? group[0]
         case .composite:
             // favorited > active > user-folder > newest
             if let fav = group.first(where: { lib.favorites.contains($0.id) }) { return fav }
             if let act = group.first(where: { lib.isActive($0) }) { return act }
-            if let u = group.first(where: { $0.fileURL.path.contains("/Library/Fonts") &&
-                                            $0.fileURL.path.hasPrefix(NSHomeDirectory()) }) { return u }
+            if let u = group.first(where: { SystemFontGuard.isInUserFolder($0.fileURL) }) { return u }
+            return group.max { $0.dateAdded < $1.dateAdded } ?? group[0]
+        case .minimizeSystem:
+            // Goal: keep as little as possible under system folders.
+            //
+            // Priority order for the keeper:
+            //   1. Any essential font (they can never be the "extra" — so if one
+            //      exists in the group, it must be the keeper regardless of
+            //      location). Otherwise we'd leave a broken group.
+            //   2. A file in ~/Library/Fonts or a user custom path.
+            //   3. A file in /Library/Fonts (admin area) — keeping it means we
+            //      remove only the SIP-protected sibling, which will silently
+            //      fail; the row surfaces this to the user.
+            //   4. Newest as a final tiebreaker.
+            if let ess = group.first(where: { SystemFontGuard.isEssential($0) }) { return ess }
+            if let u = group.first(where: { SystemFontGuard.isInUserFolder($0.fileURL) }) { return u }
+            if let shared = group.first(where: {
+                SystemFontGuard.location(of: $0.fileURL) == .systemShared
+            }) { return shared }
             return group.max { $0.dateAdded < $1.dateAdded } ?? group[0]
         }
     }
 
+    /// Collects the "extras" (non-winner, non-protected) for every group.
+    /// Essentials and SIP-protected files are silently excluded from the
+    /// selection so the user can't accidentally click Delete and brick their UI.
     private func selectAllExtras(groups: [(name: String, items: [FontItem])]) {
         var ids: Set<String> = []
         for group in groups {
             let keeper = winner(in: group.items)
             for item in group.items where item.id != keeper.id {
+                // Never queue a protected file. The row UI will also show why.
+                if SystemFontGuard.isProtected(item) { continue }
                 ids.insert(item.id)
             }
         }
         selection = ids
+    }
+
+    /// Count of extras that could actually be deleted under the current
+    /// strategy — excludes essentials and SIP-locked files. This drives the
+    /// button label so the user sees a realistic number, not a misleading one.
+    private func deletableExtrasCount(_ groups: [(name: String, items: [FontItem])]) -> Int {
+        var n = 0
+        for group in groups {
+            let keeper = winner(in: group.items)
+            for item in group.items where item.id != keeper.id {
+                if !SystemFontGuard.isProtected(item) { n += 1 }
+            }
+        }
+        return n
     }
 
     private func allExtrasCount(_ groups: [(name: String, items: [FontItem])]) -> Int {
@@ -321,17 +367,25 @@ private struct DuplicateFileRow: View {
     @Binding var selection: Set<String>
 
     var body: some View {
+        let protectionReason = SystemFontGuard.protectionReason(for: item)
+        let isProtected = protectionReason != nil
+        let location = SystemFontGuard.location(of: item.fileURL)
+
         HStack(alignment: .center, spacing: 10) {
-            // Checkbox (winners can't be checked via the standard box — too easy to misclick)
+            // Checkbox — disabled for protected files so a stray click can't
+            // queue Apple Color Emoji or SF Pro for deletion.
             Toggle("", isOn: Binding(
                 get: { selection.contains(item.id) },
                 set: { on in
+                    if isProtected { return }
                     if on { selection.insert(item.id) }
                     else  { selection.remove(item.id) }
                 }
             ))
             .labelsHidden()
             .toggleStyle(.checkbox)
+            .disabled(isProtected)
+            .help(isProtected ? (protectionReason ?? "Protected") : "Queue for deletion")
 
             // Winner crown OR active dot
             if isWinner {
@@ -352,6 +406,10 @@ private struct DuplicateFileRow: View {
                     if lib.favorites.contains(item.id) {
                         Image(systemName: "star.fill")
                             .foregroundStyle(.yellow).font(.caption)
+                    }
+                    locationBadge(for: location)
+                    if isProtected {
+                        protectedBadge(reason: protectionReason ?? "")
                     }
                 }
                 Text(item.fileURL.deletingLastPathComponent().path)
@@ -386,5 +444,35 @@ private struct DuplicateFileRow: View {
         )
         .contentShape(Rectangle())
         .onTapGesture { lib.selectedFontID = item.id }
+    }
+
+    @ViewBuilder
+    private func locationBadge(for loc: SystemFontGuard.Location) -> some View {
+        let (text, color): (String, Color) = {
+            switch loc {
+            case .systemProtected: return ("/System", .red)
+            case .systemShared:    return ("/Library", .orange)
+            case .userFonts:       return ("~/Library", .blue)
+            case .userCustom:      return ("Custom", .purple)
+            }
+        }()
+        Text(text)
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(color.opacity(0.18), in: Capsule())
+            .foregroundStyle(color)
+    }
+
+    @ViewBuilder
+    private func protectedBadge(reason: String) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: "lock.fill")
+            Text("Protected")
+        }
+        .font(.system(size: 10, weight: .semibold))
+        .padding(.horizontal, 5).padding(.vertical, 1)
+        .background(Color.gray.opacity(0.2), in: Capsule())
+        .foregroundStyle(.secondary)
+        .help(reason)
     }
 }
