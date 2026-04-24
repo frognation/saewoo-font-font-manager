@@ -243,9 +243,9 @@ final class FontLibrary: ObservableObject {
             if let c = collections.first(where: { $0.id == id }) {
                 scope = items.filter { c.fontIDs.contains($0.id) }
             } else { scope = [] }
-        case .tool:
-            // Tool views render their own data; family list is unused here,
-            // but return all so the fallback is sensible if ever visible.
+        case .tool, .cloud:
+            // Tool and Cloud views render their own data; family list is
+            // unused here, but return all so the fallback is sensible.
             scope = items
         }
         let filtered: [FontItem]
@@ -714,6 +714,8 @@ final class FontLibrary: ObservableObject {
         if path == home + "/Library/Fonts"        { return "User Fonts" }
         if path == "/Library/Fonts"               { return "Shared Fonts" }
         if path.hasPrefix("/System/Library/Fonts"){ return "System Fonts" }
+        if path.contains("/SaewooFont/GoogleFonts") { return "Google Fonts (downloaded)" }
+        if path.contains("/CoreSync/plugins/livetype") { return "Adobe Fonts (synced)" }
         return url.lastPathComponent
     }
 
@@ -811,12 +813,49 @@ enum SidebarItem: Hashable {
     case source(URL)
     case collection(UUID)
     case tool(ToolKind)
+    case cloud(CloudSource)
 
     /// Is this a Tools-section selection? Used to swap the content area
     /// away from the family list when a tool view should render instead.
     var isTool: Bool {
         if case .tool = self { return true }
         return false
+    }
+
+    /// Is this a Cloud-section selection (Google Fonts / Adobe Fonts browse)?
+    /// Same rationale as `isTool` — swaps away from the family list.
+    var isCloud: Bool {
+        if case .cloud = self { return true }
+        return false
+    }
+}
+
+/// The two cloud "sources" exposed in the sidebar under the Cloud section.
+/// Google Fonts is a true cloud-backed catalog (public API). Adobe Fonts is
+/// a filtered view of the Creative Cloud sync cache already present on disk —
+/// there's no public Adobe API to browse or download.
+enum CloudSource: String, Codable, Hashable, CaseIterable, Identifiable {
+    case google
+    case adobe
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .google: return "Google Fonts"
+        case .adobe:  return "Adobe Fonts"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .google: return "g.circle.fill"
+        case .adobe:  return "a.circle.fill"
+        }
+    }
+    var tint: Color {
+        switch self {
+        case .google: return .blue
+        case .adobe:  return Color(red: 0.98, green: 0.2, blue: 0.2) // Adobe red
+        }
     }
 }
 

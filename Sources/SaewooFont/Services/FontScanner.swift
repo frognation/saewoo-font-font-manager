@@ -17,7 +17,20 @@ enum FontScanner {
         if let adobe = Self.adobeFontsCacheURL {
             roots.append(adobe)
         }
+        // Google Fonts download cache — populated by the Cloud > Google Fonts
+        // browse view. Always included so downloaded families surface as
+        // regular FontItems in Library / Foundries / Categories without the
+        // user having to add a custom scan source.
+        roots.append(Self.googleFontsCacheURL)
         return roots
+    }()
+
+    /// Where `GoogleFontsClient` downloads its per-family TTFs / WOFF2s.
+    static let googleFontsCacheURL: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = base.appendingPathComponent("SaewooFont/GoogleFonts", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }()
 
     private static let supportedExt: Set<String> = ["ttf", "otf", "ttc", "otc", "dfont", "woff", "woff2"]

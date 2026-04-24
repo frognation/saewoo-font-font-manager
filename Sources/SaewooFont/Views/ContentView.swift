@@ -4,7 +4,8 @@ struct ContentView: View {
     @EnvironmentObject var lib: FontLibrary
     @State private var showInspector = true
 
-    /// Swap the family list for a tool view when a `.tool` row is selected.
+    /// Swap the family list for a tool view when a `.tool` or `.cloud` row
+    /// is selected.
     @ViewBuilder
     private var mainContent: some View {
         switch lib.sidebarSelection {
@@ -15,6 +16,8 @@ struct ContentView: View {
         case .tool(.missingRefs): MissingRefsView()
         case .tool(.largeFiles):  LargeFilesView()
         case .tool(.fork):        ForkView()
+        case .cloud(.google):     GoogleFontsView()
+        case .cloud(.adobe):      AdobeFontsView()
         default:                  FontListView()
         }
     }
@@ -25,7 +28,7 @@ struct ContentView: View {
                 .frame(minWidth: 240)
         } content: {
             VStack(spacing: 0) {
-                if !lib.sidebarSelection.isTool {
+                if !lib.sidebarSelection.isTool && !lib.sidebarSelection.isCloud {
                     TopToolbar()
                     Divider()
                 }

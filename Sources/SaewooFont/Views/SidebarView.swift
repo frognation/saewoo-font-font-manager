@@ -40,10 +40,25 @@ struct SidebarView: View {
     var body: some View {
         List(selection: selectionBinding) {
             sourcesSection
+            cloudSection
             librarySection
             toolsSection
         }
         .listStyle(.sidebar)
+    }
+
+    @ViewBuilder
+    private var cloudSection: some View {
+        topSection(id: "cloud", title: "Cloud",
+                   icon: "cloud.fill",
+                   tint: .cyan) {
+            ForEach(CloudSource.allCases) { src in
+                rowLabel(.cloud(src),
+                         title: src.label,
+                         icon: src.icon,
+                         tint: src.tint)
+            }
+        }
     }
 
     // MARK: - Top-level sections
