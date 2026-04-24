@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:saewoo-font-font-manager}",
+            "name": "Debug SaewooFont",
+            "target": "SaewooFont",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug SaewooFont"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:saewoo-font-font-manager}",
+            "name": "Release SaewooFont",
+            "target": "SaewooFont",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release SaewooFont"
+        }
+    ]
+}

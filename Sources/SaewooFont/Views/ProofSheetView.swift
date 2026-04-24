@@ -49,6 +49,7 @@ struct ProofSheetView: View {
     @State private var glyphGridSize: Double = 40
     @State private var glyphCache: (fontID: String, chars: [UInt32]) = ("", [])
     @State private var glyphFilter: String = ""
+    @State private var selectedGlyphDetail: GlyphDetail? = nil
 
     // Coverage-tab state
     @State private var coverageCache: (fontID: String, rows: [BlockCoverage]) = ("", [])
@@ -90,6 +91,7 @@ abcdefghijklmnopqrstuvwxyz
                 enabledFeatures.removeAll()
                 glyphCache = ("", [])
                 coverageCache = ("", [])
+                selectedGlyphDetail = nil
             }
             .onAppear {
                 if axisValues.isEmpty {
@@ -409,20 +411,33 @@ abcdefghijklmnopqrstuvwxyz
     @ViewBuilder
     private func glyphCell(cp: UInt32, item: FontItem) -> some View {
         let scalar = Unicode.Scalar(cp).map { String(Character($0)) } ?? ""
-        VStack(spacing: 4) {
-            Text(scalar)
-                .font(Font(currentFont(for: item, size: CGFloat(glyphGridSize))))
-                .frame(maxWidth: .infinity, minHeight: CGFloat(glyphGridSize + 10))
-                .padding(.top, 6)
-            Text(String(format: "U+%04X", cp))
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(.secondary)
+        Button {
+            selectedGlyphDetail = glyphDetail(for: cp, item: item)
+        } label: {
+            VStack(spacing: 4) {
+                Text(scalar)
+                    .font(Font(currentFont(for: item, size: CGFloat(glyphGridSize))))
+                    .frame(maxWidth: .infinity, minHeight: CGFloat(glyphGridSize + 10))
+                    .padding(.top, 6)
+                Text(String(format: "U+%04X", cp))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(4)
+            .background(Color(NSColor.windowBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.secondary.opacity(0.15), lineWidth: 1))
         }
-        .padding(4)
-        .background(Color(NSColor.windowBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6)
-            .stroke(Color.secondary.opacity(0.15), lineWidth: 1))
+        .buttonStyle(.plain)
         .help("U+\(String(format: "%04X", cp)) — \(scalar)")
+        .popover(isPresented: Binding(
+            get: { selectedGlyphDetail?.id == GlyphDetail.id(for: item.id, codepoint: cp) },
+            set: { if !$0 { selectedGlyphDetail = nil } }
+        ), arrowEdge: .bottom) {
+            if let detail = selectedGlyphDetail {
+                GlyphDetailPopover(detail: detail)
+            }
+        }
     }
 
     // MARK: - Coverage tab
@@ -518,6 +533,16 @@ abcdefghijklmnopqrstuvwxyz
             return all.contains(target) ? [target] : []
         }
         return []
+    }
+
+    private func glyphDetail(for codepoint: UInt32, item: FontItem) -> GlyphDetail? {
+        ProofGlyphInspector.inspect(
+            codepoint: codepoint,
+            item: item,
+            size: max(CGFloat(glyphGridSize) * 3, 140),
+            features: enabledFeatures,
+            axisValues: axisValues
+        )
     }
 
     private func coverageRows(for item: FontItem) -> [BlockCoverage] {
@@ -854,6 +879,206 @@ struct ProofCanvas: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let tv = notification.object as? NSTextView else { return }
             parent.text = tv.string
+        }
+    }
+}
+
+struct GlyphDetail: Identifiable {
+    let id: String
+    let codepoint: UInt32
+    let scalar: String
+    let glyphID: CGGlyph
+    let glyphName: String
+    let unicodeCategory: String
+    let advanceWidth: CGFloat
+    let bounds: CGRect
+    let path: CGPath?
+
+    static func id(for fontID: String, codepoint: UInt32) -> String {
+        "\(fontID)::\(codepoint)"
+    }
+}
+
+private struct GlyphDetailPopover: View {
+    let detail: GlyphDetail
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(detail.scalar.isEmpty ? "(non-printing)" : detail.scalar)
+                        .font(.system(size: 36))
+                    Text(String(format: "U+%04X", detail.codepoint))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                GlyphOutlineView(path: detail.path)
+                    .frame(width: 160, height: 160)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                glyphInfoRow("Glyph name", detail.glyphName, mono: true)
+                glyphInfoRow("Unicode category", detail.unicodeCategory)
+                glyphInfoRow("Glyph ID", "\(detail.glyphID)", mono: true)
+                glyphInfoRow("Advance width", String(format: "%.1f", detail.advanceWidth), mono: true)
+                glyphInfoRow(
+                    "Bounds",
+                    String(format: "x %.1f  y %.1f  w %.1f  h %.1f",
+                           detail.bounds.origin.x,
+                           detail.bounds.origin.y,
+                           detail.bounds.width,
+                           detail.bounds.height),
+                    mono: true
+                )
+            }
+        }
+        .padding(14)
+        .frame(width: 360)
+    }
+
+    private func glyphInfoRow(_ label: String, _ value: String, mono: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(mono ? .system(.caption, design: .monospaced) : .caption)
+                .textSelection(.enabled)
+        }
+    }
+}
+
+private struct GlyphOutlineView: View {
+    let path: CGPath?
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(NSColor.textBackgroundColor))
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+
+                if let fitted = fittedPath(in: geo.size) {
+                    Path(fitted)
+                        .fill(Color.accentColor.opacity(0.16))
+                    Path(fitted)
+                        .stroke(Color.accentColor, lineWidth: 1.25)
+                } else {
+                    VStack(spacing: 6) {
+                        Image(systemName: "scribble.variable")
+                            .foregroundStyle(.secondary)
+                        Text("No outline")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func fittedPath(in size: CGSize) -> CGPath? {
+        guard let path else { return nil }
+        let bounds = path.boundingBoxOfPath.integral
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+
+        let inset: CGFloat = 18
+        let availableWidth = max(size.width - inset * 2, 1)
+        let availableHeight = max(size.height - inset * 2, 1)
+        let scale = min(availableWidth / bounds.width, availableHeight / bounds.height)
+        let scaledWidth = bounds.width * scale
+        let scaledHeight = bounds.height * scale
+        let originX = (size.width - scaledWidth) / 2 - bounds.minX * scale
+        let originY = (size.height - scaledHeight) / 2 + bounds.maxY * scale
+
+        var transform = CGAffineTransform.identity
+        transform = transform.translatedBy(x: originX, y: originY)
+        transform = transform.scaledBy(x: scale, y: -scale)
+        return path.copy(using: &transform)
+    }
+}
+
+enum ProofGlyphInspector {
+    static func inspect(codepoint: UInt32,
+                        item: FontItem,
+                        size: CGFloat,
+                        features: Set<String>,
+                        axisValues: [UInt32: Double]) -> GlyphDetail? {
+        guard let font = ProofFontFactory.font(
+            for: item,
+            size: size,
+            features: features,
+            axisValues: axisValues
+        ) else { return nil }
+
+        let ctFont = font as CTFont
+        guard let scalarValue = Unicode.Scalar(codepoint) else { return nil }
+        var character = UniChar(scalarValue.value)
+        var glyph: CGGlyph = 0
+        guard CTFontGetGlyphsForCharacters(ctFont, &character, &glyph, 1), glyph != 0 else {
+            return nil
+        }
+
+        var advance = CGSize.zero
+        CTFontGetAdvancesForGlyphs(ctFont, .default, [glyph], &advance, 1)
+        var bounds = CGRect.zero
+        CTFontGetBoundingRectsForGlyphs(ctFont, .default, [glyph], &bounds, 1)
+
+        let name = (CTFontCopyNameForGlyph(ctFont, glyph) as String?) ?? "(unnamed glyph)"
+        let category = scalarValue.properties.generalCategory.displayName
+        let path = CTFontCreatePathForGlyph(ctFont, glyph, nil)
+
+        return GlyphDetail(
+            id: GlyphDetail.id(for: item.id, codepoint: codepoint),
+            codepoint: codepoint,
+            scalar: String(Character(scalarValue)),
+            glyphID: glyph,
+            glyphName: name,
+            unicodeCategory: category,
+            advanceWidth: advance.width,
+            bounds: bounds,
+            path: path
+        )
+    }
+}
+
+private extension Unicode.GeneralCategory {
+    var displayName: String {
+        switch self {
+        case .uppercaseLetter: return "Uppercase Letter"
+        case .lowercaseLetter: return "Lowercase Letter"
+        case .titlecaseLetter: return "Titlecase Letter"
+        case .modifierLetter: return "Modifier Letter"
+        case .otherLetter: return "Other Letter"
+        case .nonspacingMark: return "Nonspacing Mark"
+        case .spacingMark: return "Spacing Mark"
+        case .enclosingMark: return "Enclosing Mark"
+        case .decimalNumber: return "Decimal Number"
+        case .letterNumber: return "Letter Number"
+        case .otherNumber: return "Other Number"
+        case .connectorPunctuation: return "Connector Punctuation"
+        case .dashPunctuation: return "Dash Punctuation"
+        case .openPunctuation: return "Open Punctuation"
+        case .closePunctuation: return "Close Punctuation"
+        case .initialPunctuation: return "Initial Punctuation"
+        case .finalPunctuation: return "Final Punctuation"
+        case .otherPunctuation: return "Other Punctuation"
+        case .mathSymbol: return "Math Symbol"
+        case .currencySymbol: return "Currency Symbol"
+        case .modifierSymbol: return "Modifier Symbol"
+        case .otherSymbol: return "Other Symbol"
+        case .spaceSeparator: return "Space Separator"
+        case .lineSeparator: return "Line Separator"
+        case .paragraphSeparator: return "Paragraph Separator"
+        case .control: return "Control"
+        case .format: return "Format"
+        case .surrogate: return "Surrogate"
+        case .privateUse: return "Private Use"
+        case .unassigned: return "Unassigned"
+        @unknown default: return "Other"
         }
     }
 }
