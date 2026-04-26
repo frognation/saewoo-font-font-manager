@@ -4,8 +4,77 @@ Rolling notes for picking this project back up in a new agent / new machine.
 Sessions are appended in reverse chronological order at the top. For the
 one-paste session-start prompt, see `NEXT_SESSION.md`.
 
-**Current branch: `work/compB-20260422`** (8 commits ahead of `main`).
-Do not land on `main` directly — see "Cross-machine workflow" at the bottom.
+**Current branch: `main`**.
+The previous `work/compB-20260422` work has been merged back into `main`;
+future sessions can start from `main` unless the user asks for a feature branch.
+
+---
+
+## Session 3 — merged to `main`
+
+`main` now includes the Session 2 branch plus two follow-up commits:
+
+| Commit     | Summary |
+|------------|---------|
+| `633b379`  | Proof Sheet glyph-detail popover, plus `.vscode/launch.json` for local launch/debug. |
+| `9b56ab3`  | Cloud section: Google Fonts browse/download/install/remove, Adobe Fonts filtered view, Google Fonts cache scan root. |
+
+### Google Fonts + Adobe Fonts status
+
+The Google Fonts connector from the old queued list is **shipped**:
+- `GoogleFontsClient` fetches `https://fonts.google.com/metadata/fonts`,
+  strips the XSSI prefix, caches the catalog for 24h, downloads CSS2 font
+  URLs, and stores local files under
+  `~/Library/Application Support/SaewooFont/GoogleFonts/`.
+- `GoogleFontsView` adds catalog search, category filter, sort, per-family
+  download/remove, and triggers a library rescan after changes.
+- `FontScanner.defaultSearchRoots` always includes the Google Fonts cache.
+- `AdobeFontsView` shows only fonts already synced locally by Creative Cloud;
+  there is no public Adobe download/browse API in the app.
+
+### Current next work
+
+**Duplicates tool — three explicit user requests still open:**
+1. Backup-before-delete system with a reversible manifest.
+   Suggested location: `~/Library/Application Support/SaewooFont/DuplicateBackups/{timestamp}/`
+   with a `manifest.json` recording original paths so a "Restore last delete"
+   button can move files back. Trash works but isn't atomic with our state.
+2. Duplicate list filters/sorts: path, filename, size.
+3. Per-source delete-lock so some folders are never targeted regardless of
+   Keep strategy. Lock state is orthogonal to Keep priority — either
+   per-source toggles in Sources, or a broader "options" panel.
+
+**Cloud follow-ups from `9b56ab3`:**
+
+4. **WOFF2 → TTF fallback for Google Fonts.** `GoogleFontsClient.download`
+   currently registers whatever the CSS2 endpoint returns (woff2 by default).
+   If `CTFontManagerRegisterFontURLs` rejects a woff2 file on the user's
+   macOS version, no fallback happens. Add a TTF retry that pulls from
+   `github.com/google/fonts/raw/main/ofl/{slug}/{slug}-{variant}.ttf` when
+   woff2 registration produces errors.
+
+5. **Adobe Fonts metadata enrichment.** Files in `.../CoreSync/plugins/livetype/.r/`
+   are numerically named (`1234`, `5678`, …); we lean on Core Text for the
+   family name only. Adobe drops `AdobeFnt*.lst` plist files in the same
+   tree with prettier metadata (postScriptFontName, copyright, version, …).
+   Parse those and merge into the FontItem at scan time so Adobe Fonts show
+   up with their original family/style names.
+
+6. **Google Fonts variable-axis discovery.** The CSS2 endpoint returns
+   wght-only URLs unless we encode the axis range. For variable families
+   like Inter or Recursive, fetch a single woff2 covering the axis range
+   instead of N static variants. Detect "is variable" from the metadata's
+   `axes` field (already in the JSON, just not yet decoded).
+
+7. **Bulk download** — "Download top N popular families" button so users
+   can seed a working library in one click. Wire to the existing download
+   pipeline; honor a concurrency limit so we don't slam gstatic.com.
+
+8. **Catalog endpoint fallback.** `fonts.google.com/metadata/fonts` is
+   undocumented — if Google changes it, browse breaks. Add a fallback
+   to the official developer API
+   (`https://www.googleapis.com/webfonts/v1/webfonts`) when an explicit
+   key is set in Settings (or env var). Surface a clear error otherwise.
 
 ---
 
@@ -144,17 +213,12 @@ Explicit user requests, in priority order:
    priority. Either add per-source lock toggles, or propose a broader
    options system that captures the same idea.
 
-4. **Google Fonts connector.**
-   Mirror RightFont's connected-catalog feature. Plan:
-   - Catalog fetch: `https://fonts.google.com/metadata/fonts`
-     (undocumented but public, JSON with a `)]}'` XSS prefix; free).
-   - Download: TTFs to
-     `~/Library/Application Support/SaewooFont/GoogleFonts/`
-     cache, add that dir as a source.
-   - Browser UI: Tools section entry "Google Fonts" with search,
-     per-family install / remove.
+4. **Done — Google Fonts connector.**
+   Shipped in `9b56ab3` with catalog fetch/cache, per-family download/remove,
+   local Google Fonts scan root, and Cloud > Google Fonts UI.
 
-5. (Already shipped — Adobe Fonts local read is live.)
+5. **Done — Adobe Fonts local read.**
+   Shipped in `96445ac` / refined in `9b56ab3`.
 
 ---
 
@@ -247,22 +311,19 @@ Files: `Services/FontLibrary.swift`, `Services/FontScanner.swift`,
 ## Known broken / in-flight
 
 ### ⚠️ New Project / New Palette name typing
-**Status: 4 attempts failed, 5th attempt (minimal NSAlert) deployed but unverified.**
+**Status: root cause fixed in `9a74015`. Re-check only if the user reports a regression.**
 
-Five progressive attempts, each more AppKit-native than the last:
+Earlier failed attempts, each more AppKit-native than the last:
 1. SwiftUI `TextField` + `@FocusState` + dispatch delay — user reported still can't type
 2. NSTextField via NSViewRepresentable + `makeFirstResponder` — still broken
 3. Same as #2 + `EditableTextField` subclass + retry loop — still broken
 4. `NSAlert` with custom `AccessoryView` NSView subclass (name field + color swatches) — still broken
-5. **Current**: `NSAlert` with plain `NSTextField` as `accessoryView`, no custom subclass; `alert.layout()` before `initialFirstResponder`; color picker moved to a "Change Color" submenu on each collection's right-click menu
+5. `NSAlert` with plain `NSTextField` as `accessoryView`, no custom subclass; also insufficient by itself.
 
-If #5 still fails on the user's machine, suspect environmental causes — in priority order:
-- **Korean IME**: try Ctrl+Space to force English input while testing
-- **Xcode debugger**: run via `⌘⇧R` (Run Without Debugging) or `swift run -c release SaewooFont` from terminal
-- **Keyboard-hooking apps**: Karabiner-Elements, BetterTouchTool, Alfred hotkeys
-- **Accessibility permissions** in System Settings → Privacy & Security
-
-If environmental is ruled out, next attempt = move to a dedicated `NSWindow` (not a sheet, not an alert) presented modally via `NSApp.runModal(for:)`. That's the last-resort AppKit pattern.
+The actual fix was app-wide: `SaewooFontApp` now installs an
+`NSApplicationDelegate` and calls `NSApp.setActivationPolicy(.regular)` plus
+`NSApp.activate(ignoringOtherApps: true)` on launch. SPM-built SwiftUI apps
+without a bundle/Info.plist can show windows while not receiving key events.
 
 File: `Views/AddCollectionSheet.swift`.
 
@@ -276,29 +337,37 @@ design. Activation state persists across relaunches within a login session only.
 
 ```
 Sources/SaewooFont/
-├── App/SaewooFontApp.swift           @main + window + commands
+├── App/SaewooFontApp.swift           @main + AppDelegate (activation policy fix)
 ├── Models/
 │   ├── FontItem.swift                one-row-per-face + VariationAxis
 │   └── FontCollection.swift          Projects/Palettes + VariableInstance + LibraryState
 ├── Services/
 │   ├── FontScanner.swift             filesystem walk → items + orphanURLs (parallel)
+│   │                                 + scanAvailableInSystem + Adobe & Google cache roots
 │   ├── FontClassifier.swift          traits + PANOSE + name → [FontCategory] + [FontMood]
 │   ├── FontActivator.swift           CTFontManager .session scope (actor)
 │   ├── Persistence.swift             state.json + library-cache.json
-│   └── FontLibrary.swift             @MainActor coordinator; owns derivedVersion + caches
+│   ├── FontLibrary.swift             @MainActor coordinator; derivedVersion + caches
+│   ├── SystemFontGuard.swift         essentials + SIP-protection rules for Duplicates/Organize
+│   ├── RightFontImporter.swift       .rightfontlibrary parser → palettes + favorites
+│   ├── UFOExporter.swift             CGPath → GLIF + designspace XML writer (Fork tool)
+│   └── GoogleFontsClient.swift       /metadata/fonts catalog + CSS2 download + cache
 └── Views/
-    ├── ContentView.swift             NavigationSplitView shell + tool routing
-    ├── SidebarView.swift             3-tier collapsible hierarchy
-    ├── FontListView.swift            family-grouped list; FontPreviewCache
+    ├── ContentView.swift             NavigationSplitView + tool/cloud routing
+    ├── SidebarView.swift             4-tier hierarchy: Sources / Cloud / Library / Tools
+    ├── FontListView.swift            family-grouped list; FontPreviewCache (NSCache, 1000)
     ├── InspectorView.swift           metadata + classification + variable section
     ├── VariablePlaygroundView.swift  axis sliders + instance save
-    ├── AddCollectionSheet.swift      NSAlert-based project/palette prompt
-    ├── DuplicatesView.swift          PS-name collisions; bulk trash with strategy
+    ├── AddCollectionSheet.swift      AppKit sheet (beginSheet) + NewCollectionPrompt
+    ├── DuplicatesView.swift          PS-name collisions; bulk trash + 5 keep strategies
     ├── OrganizeView.swift            Move / Sort-into-subfolders
-    ├── ProofSheetView.swift          Type / Glyphs / Coverage + export
+    ├── ProofSheetView.swift          Type / Glyphs / Coverage + export + GlyphDetail popover
     ├── OrphansView.swift             unparseable files
     ├── MissingRefsView.swift         dangling favorite/collection refs
-    └── LargeFilesView.swift          biggest files first
+    ├── LargeFilesView.swift          biggest files first
+    ├── ForkView.swift                UFO/Designspace exporter UI
+    ├── GoogleFontsView.swift         catalog browse + per-family download
+    └── AdobeFontsView.swift          CC cache filtered list + empty states
 ```
 
 ### Critical invariants
@@ -320,34 +389,58 @@ Sources/SaewooFont/
 
 ## Roadmap — next obvious picks
 
-In priority order based on what's been asked or lightly scoped:
+Re-ranked after Sessions 2 + 3. Top items duplicate the Session 3 "Current
+next work" list above (Duplicates backup, list filters, source-lock, the
+five cloud follow-ups). Beyond those:
 
-1. **Cloud folders UX** — the "+" button becomes a menu with
+1. **Local cloud-folder picker shortcuts** — different from the Cloud section
+   we shipped. The "+" Add Source button could become a menu with
    `Local folder… / Google Drive / Dropbox / iCloud Drive / OneDrive / Other…`
-   shortcuts that navigate the picker to the common File Provider mount points.
-   Technical: no API integration needed — those are regular folders once the
-   user's sync app has them mounted.
+   that pre-navigates `NSOpenPanel` to common File Provider mount points.
+   No API integration needed — those are regular folders once the sync app
+   has them mounted. Useful for users who keep font archives in cloud sync
+   apps.
 
-2. **Glyph detail popover** — in Proof Sheet's Glyphs tab, click a glyph →
-   popover with glyph name (from 'post' table), Unicode category, vector outline.
+2. **Waterfall view in Proof Sheet** — render one line at 8–10 different
+   sizes (8/10/12/14/18/24/36/48/72/96pt) for comparing rendering at
+   different scales. Would slot in as a fourth tab next to Type / Glyphs /
+   Coverage.
 
-3. **Waterfall view** — a Proof Sheet mode that renders one line at 8–10
-   different sizes (8/10/12/14/18/24/36/48/72/96pt) for comparing rendering at
-   different scales.
-
-4. **Source-file support (the hard one)** — Python bridge to
+3. **Source-file support (the hard one)** — Python bridge to
    `fontmake` / `glyphsLib` if the user has them installed, compiling `.ufo` /
    `.glyphs` / `.designspace` on-the-fly to a temp `.otf` for proofing. Would
-   enable FontGoggle-level source-file support. Needs: Python discovery, shell
-   helper, temp-file lifecycle, UI for "compiled proof" state.
+   enable FontGoggle-level source-file support without writing our own
+   parser. Needs: Python discovery, shell helper, temp-file lifecycle, UI
+   for "compiled proof" state. Note: the **Fork tool already writes** UFO
+   and designspace; this would be the read direction.
 
-5. **Activation-history tool** — track when a font was last activated so an
+4. **Activation-history tool** — track when a font was last activated so an
    "Unused Fonts" tool can surface zombies. Would need a new `@Published`
-   map in `LibraryState`.
+   map in `LibraryState` keyed by FontItem.id, persisted via Persistence.
+   Could become a sixth Tools entry alongside Largest Files.
 
-6. **iCloud / Dropbox sync of state.json** — share Projects + Palettes
+5. **iCloud / Dropbox sync of state.json** — share Projects + Palettes
    across machines. Trivial if sync folder is already mounted; harder for
-   seamless conflict resolution.
+   seamless conflict resolution. Also useful for the Google Fonts catalog
+   cache so multiple machines don't each re-fetch.
+
+6. **Recently downloaded** Google Fonts filter — tracks the last 20 families
+   downloaded via `GoogleFontsClient` so users can quickly find what they
+   just installed. Cheap; lives next to the existing Sort modes.
+
+7. **Settings panel** — there isn't one yet. Will eventually need one for:
+   Google Fonts API key (for catalog fallback), default download location,
+   activation policy, IME / keyboard accessibility hints. Currently
+   everything is implicit / hardcoded.
+
+### Done in past sessions (do not re-add)
+
+- Glyph detail popover in Proof Sheet (`633b379`).
+- Cloud section with Google Fonts + Adobe Fonts (`9b56ab3`).
+- All keyboard input bugs (resolved by activation-policy fix in `9a74015`).
+- Three-tier sidebar with collapsibles (Session 1, plus Cloud added in
+  Session 3 making it four-tier).
+- Multi-category tags (Session 1, `cb3abb4`).
 
 ---
 
@@ -365,10 +458,10 @@ Saewoo Font macOS 폰트매니저 프로젝트 이어서 작업할게.
 
 확인 체크리스트:
 1. 현재 브랜치 상태 (git status / git log)
-2. HANDOFF.md의 "Known broken / in-flight" 섹션 — 특히 New Project 이름
-   입력 버그가 5번째 시도(NSAlert with plain NSTextField)에서 해결됐는지
-   내가 확인했는지 물어봐. 안 됐으면 그 해결부터.
-3. HANDOFF.md "Roadmap" 섹션에서 내가 다음 항목을 골라주면 그걸 진행.
+2. `main`에 최신 작업이 병합돼 있는지 확인. 낡은 `work/compB-*` 지침은
+   역사 기록으로만 취급.
+3. HANDOFF.md "Queued for the next session" 또는 "Roadmap" 섹션에서 내가
+   다음 항목을 골라주면 그걸 진행.
 
 작업 방식:
 - 네이티브 macOS SwiftUI 앱이라 수정해도 Hot Reload 안 돼. 내가 Xcode에서
