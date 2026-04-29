@@ -4,26 +4,45 @@ import AppKit
 struct FontListView: View {
     @EnvironmentObject var lib: FontLibrary
     @State private var expandedFamilies: Set<String> = []
+    /// Set of selected family keys. SwiftUI List manages Cmd+A, Shift+click,
+    /// Cmd+click for free when bound to a Set<ID> selection.
+    @State private var selection: Set<String> = []
 
     var body: some View {
         let groups = lib.familyGroups
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(groups) { group in
-                    FamilyGroupRow(group: group,
-                                   expanded: expandedFamilies.contains(group.key),
-                                   toggleExpand: {
-                                       if expandedFamilies.contains(group.key) {
-                                           expandedFamilies.remove(group.key)
-                                       } else {
-                                           expandedFamilies.insert(group.key)
-                                       }
-                                   })
-                    Divider().opacity(0.4)
+        // Faces of every currently-selected family — passed into each row so
+        // context-menu actions apply to the whole selection at once.
+        let selectionFaces: [FontItem] = groups
+            .filter { selection.contains($0.key) }
+            .flatMap { $0.faces }
+
+        List(groups, selection: $selection) { group in
+            FamilyGroupRow(
+                group: group,
+                expanded: expandedFamilies.contains(group.key),
+                isInSelection: selection.contains(group.key),
+                selectionFaces: selectionFaces,
+                toggleExpand: {
+                    if expandedFamilies.contains(group.key) {
+                        expandedFamilies.remove(group.key)
+                    } else {
+                        expandedFamilies.insert(group.key)
+                    }
                 }
+            )
+            .listRowInsets(EdgeInsets())
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
+        }
+        .listStyle(.plain)
+        .background(Color(NSColor.textBackgroundColor))
+        // Keep the single-selection inspector in sync with the lead selected family.
+        .onChange(of: selection) { newSel in
+            if let firstKey = newSel.first,
+               let group = groups.first(where: { $0.key == firstKey }) {
+                lib.selectedFontID = group.faces.first?.id
             }
         }
-        .background(Color(NSColor.textBackgroundColor))
     }
 }
 
@@ -31,6 +50,10 @@ struct FamilyGroupRow: View {
     @EnvironmentObject var lib: FontLibrary
     let group: FontFamilyGroup
     let expanded: Bool
+    /// True when this row is part of the current multi-selection.
+    let isInSelection: Bool
+    /// All FontItem faces from the entire selection (for batch context-menu ops).
+    let selectionFaces: [FontItem]
     let toggleExpand: () -> Void
 
     var body: some View {
@@ -67,11 +90,11 @@ struct FamilyGroupRow: View {
             }
             .padding(.horizontal, 14).padding(.vertical, 6)
             .contentShape(Rectangle())
-            .onTapGesture {
-                lib.selectedFontID = primary.id
-            }
-            .background(lib.selectedFontID == primary.id ? Color.accentColor.opacity(0.12) : Color.clear)
-            .contextMenu { rowContextMenu(items: group.faces) }
+            // Clicking the header also updates the inspector (single-face view).
+            .onTapGesture { lib.selectedFontID = primary.id }
+            .background(isInSelection ? Color.accentColor.opacity(0.10) : Color.clear)
+
+            Divider().opacity(0.4)
 
             if expanded {
                 ForEach(group.faces) { face in
@@ -81,7 +104,18 @@ struct FamilyGroupRow: View {
                 }
             }
         }
+        .contextMenu {
+            // When right-clicking inside a multi-selection, apply the action
+            // to ALL selected families. If this row isn't part of the current
+            // selection, operate only on this group.
+            let targets = isInSelection && selectionFaces.count > group.faces.count
+                ? selectionFaces
+                : group.faces
+            rowContextMenu(items: targets)
+        }
     }
+
+    // MARK: - Sub-views
 
     @ViewBuilder
     private func activationDot(for group: FontFamilyGroup) -> some View {
@@ -110,17 +144,18 @@ struct FamilyGroupRow: View {
 
     @ViewBuilder
     private func rowContextMenu(items: [FontItem]) -> some View {
-        Button("Activate") { Task { await lib.setActiveMany(items, active: true) } }
-        Button("Deactivate") { Task { await lib.setActiveMany(items, active: false) } }
+        let label = items.count > 1 ? " (\(items.count))" : ""
+        Button("Activate\(label)") { Task { await lib.setActiveMany(items, active: true) } }
+        Button("Deactivate\(label)") { Task { await lib.setActiveMany(items, active: false) } }
         Divider()
-        Menu("Add to Project") {
+        Menu("Add to Project\(label)") {
             let projects = lib.collections.filter { $0.kind == .project }
             if projects.isEmpty { Text("No projects").foregroundStyle(.secondary) }
             ForEach(projects) { p in
                 Button(p.name) { lib.addToCollection(p.id, fontIDs: items.map { $0.id }) }
             }
         }
-        Menu("Add to Palette") {
+        Menu("Add to Palette\(label)") {
             let palettes = lib.collections.filter { $0.kind == .palette }
             if palettes.isEmpty { Text("No palettes").foregroundStyle(.secondary) }
             ForEach(palettes) { p in
@@ -201,11 +236,11 @@ final class FontPreviewCache {
     static let shared = FontPreviewCache()
 
     /// NSCache gives us automatic LRU-ish eviction once we exceed `countLimit`,
-    /// and is thread-safe. 1000 cached NSFonts is enough to cover a typical
-    /// visible list without unbounded memory growth over a long session.
+    /// and is thread-safe. 2000 cached NSFonts covers a typical visible list
+    /// comfortably even with 70k+ faces in the library.
     private let cache: NSCache<NSString, NSFont> = {
         let c = NSCache<NSString, NSFont>()
-        c.countLimit = 1000
+        c.countLimit = 2000
         return c
     }()
 
