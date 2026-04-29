@@ -61,15 +61,24 @@ enum FontScanner {
     /// chunk concurrently. For thousands of fonts this is typically 3–4× faster
     /// than the serial path on a modern Mac. Core Text's descriptor creation is
     /// thread-safe for disjoint URLs.
-    static func scanParallel(roots: [URL], chunkCount: Int = 8) async -> Result {
+    static func scanParallel(roots: [URL],
+                             chunkCount: Int = ProcessInfo.processInfo.activeProcessorCount) async -> Result {
         let files = collectFiles(in: roots)
-        guard !files.isEmpty else { return Result(items: [], orphanURLs: []) }
+        return await parseFiles(files, chunkCount: chunkCount)
+    }
 
-        let stride = max(1, (files.count + chunkCount - 1) / chunkCount)
+    /// Parse a pre-collected list of URLs without re-enumerating the filesystem.
+    /// Used by the incremental-scan path in FontLibrary so it can skip files
+    /// whose mtime/size haven't changed since the last scan.
+    static func parseFiles(_ urls: [URL],
+                           chunkCount: Int = ProcessInfo.processInfo.activeProcessorCount) async -> Result {
+        guard !urls.isEmpty else { return Result(items: [], orphanURLs: []) }
+
+        let stride = max(1, (urls.count + chunkCount - 1) / chunkCount)
         var chunks: [[URL]] = []
         var i = 0
-        while i < files.count {
-            chunks.append(Array(files[i..<min(i + stride, files.count)]))
+        while i < urls.count {
+            chunks.append(Array(urls[i..<min(i + stride, urls.count)]))
             i += stride
         }
 
@@ -96,11 +105,26 @@ enum FontScanner {
         }
     }
 
+    /// Enumerate files under `roots` and return each URL together with its
+    /// last-modified date and file size. Cheaper than parsing — just stat calls.
+    /// Used by the incremental-scan snapshot diffing logic.
+    static func collectFilesWithStats(in roots: [URL]) -> [(url: URL, mtime: Date, size: Int64)] {
+        collectFiles(in: roots).compactMap { url in
+            guard let vals = try? url.resourceValues(
+                forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                  let mtime = vals.contentModificationDate,
+                  let size  = vals.fileSize
+            else { return nil }
+            return (url.standardizedFileURL, mtime, Int64(size))
+        }
+    }
+
     static func fontFileURLs(roots: [URL]) -> [URL] {
         collectFiles(in: roots).map { $0.standardizedFileURL }
     }
 
-    private static func collectFiles(in roots: [URL]) -> [URL] {
+    // make internal so FontLibrary can call it directly
+    static func collectFiles(in roots: [URL]) -> [URL] {
         let fm = FileManager.default
         var files: [URL] = []
         for rawRoot in roots {
