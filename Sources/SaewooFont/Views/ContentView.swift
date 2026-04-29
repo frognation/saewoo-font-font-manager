@@ -12,6 +12,7 @@ struct ContentView: View {
         case .tool(.duplicates):  DuplicatesView()
         case .tool(.organize):    OrganizeView()
         case .tool(.proofSheet):  ProofSheetView()
+        case .tool(.documentFonts): DocumentFontsView()
         case .tool(.orphans):     OrphansView()
         case .tool(.missingRefs): MissingRefsView()
         case .tool(.largeFiles):  LargeFilesView()

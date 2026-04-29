@@ -11,6 +11,10 @@ enum Persistence {
 
     static var stateURL: URL { appFolder.appendingPathComponent("state.json") }
     static var cacheURL: URL { appFolder.appendingPathComponent("library-cache.json") }
+    static var cacheModificationDate: Date? {
+        let values = try? cacheURL.resourceValues(forKeys: [.contentModificationDateKey])
+        return values?.contentModificationDate
+    }
 
     static func loadState() -> LibraryState {
         guard let data = try? Data(contentsOf: stateURL),

@@ -182,6 +182,10 @@ struct SidebarView: View {
                      title: ToolKind.proofSheet.label,
                      icon: ToolKind.proofSheet.icon,
                      tint: ToolKind.proofSheet.tint)
+            rowLabel(.tool(.documentFonts),
+                     title: ToolKind.documentFonts.label,
+                     icon: ToolKind.documentFonts.icon,
+                     tint: ToolKind.documentFonts.tint)
             rowLabel(.tool(.orphans),
                      title: ToolKind.orphans.label,
                      icon: ToolKind.orphans.icon,
@@ -412,6 +416,51 @@ struct SidebarView: View {
         alert.runModal()
     }
 
+    @MainActor
+    private func importIllustratorFonts(into project: FontCollection) {
+        Task { @MainActor in
+            do {
+                let scan = try await DocumentFontImporter.scanIllustratorActiveDocument()
+                guard let report = lib.importDocumentFonts(scan, intoProject: project.id) else {
+                    presentImportError(title: "Import Failed",
+                                       message: "The selected Project no longer exists.")
+                    return
+                }
+                presentDocumentFontImportReport(report)
+            } catch {
+                presentImportError(title: "Could Not Import Illustrator Fonts",
+                                   message: error.localizedDescription)
+            }
+        }
+    }
+
+    @MainActor
+    private func presentDocumentFontImportReport(_ r: FontLibrary.DocumentFontImportReport) {
+        let alert = NSAlert()
+        alert.messageText = "Imported document fonts"
+        alert.informativeText = """
+        \(r.sourceName) -> \(r.projectName)
+
+        \(r.requestedCount) document font\(r.requestedCount == 1 ? "" : "s") found.
+        \(r.matchedFaceCount) local face\(r.matchedFaceCount == 1 ? "" : "s") matched.
+        \(r.addedCount) new face\(r.addedCount == 1 ? "" : "s") added.
+        \(r.alreadyPresentCount) already present.
+        \(r.missingCount) missing from this library.
+        """
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    @MainActor
+    private func presentImportError(title: String, message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
     private var hiddenSourcesMenu: some View {
         let auto = lib.visibleDefaultSources.filter { lib.itemsInSource($0).count < 2 }
         let manual = Array(lib.hiddenDefaultSources).map { URL(fileURLWithPath: $0) }
@@ -505,6 +554,15 @@ struct SidebarView: View {
             }
             Button("Deactivate All") {
                 Task { await lib.setActiveMany(lib.items.filter { c.fontIDs.contains($0.id) }, active: false) }
+            }
+            if c.kind == .project {
+                Divider()
+                Button("Add Fonts from Illustrator Document") {
+                    importIllustratorFonts(into: c)
+                }
+                Button("Open Document Fonts Importer") {
+                    lib.openDocumentFontImporter(targetProjectID: c.id)
+                }
             }
             Divider()
             Menu("Change Color") {

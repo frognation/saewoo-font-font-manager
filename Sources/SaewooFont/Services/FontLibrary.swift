@@ -54,6 +54,7 @@ final class FontLibrary: ObservableObject {
 
     @Published var sidebarSelection: SidebarItem = .allFonts
     @Published var selectedFontID: String? = nil
+    @Published var documentFontImportTargetProjectID: UUID? = nil
 
     /// What the user is currently typing. Bound to the search text field so
     /// every keystroke only updates this one tiny string — no derived data
@@ -91,6 +92,9 @@ final class FontLibrary: ObservableObject {
     }
 
     private let activator = FontActivator()
+    private let sourceWatcher = FontSourceWatcher()
+    private var sourceChangeDebounceTask: Task<Void, Never>?
+    private var pendingSourceChangeRescan = false
 
     // MARK: - Bootstrap
 
@@ -107,7 +111,7 @@ final class FontLibrary: ObservableObject {
         self.previewSize = state.previewSize > 0 ? state.previewSize : previewSize
 
         if let cached = Persistence.loadCachedLibrary(), !cached.isEmpty,
-           !Self.cacheLooksStale(cached) {
+           !Self.cacheLooksStale(cached, roots: scanRoots) {
             self.items = cached
             invalidateDerived()
         } else {
@@ -116,14 +120,20 @@ final class FontLibrary: ObservableObject {
 
         // Re-apply activation state from last launch (session scope clears on logout).
         await reapplyActivations()
+        updateSourceWatcher()
     }
 
     // MARK: - Scanning
 
     func rescan() async {
+        if isScanning {
+            pendingSourceChangeRescan = true
+            return
+        }
+
         isScanning = true
         scanStatus = "Scanning fonts…"
-        let roots = visibleDefaultSources + customScanPaths
+        let roots = scanRoots
         let result = await FontScanner.scanParallel(roots: roots)
         var merged = result.items
 
@@ -157,6 +167,36 @@ final class FontLibrary: ObservableObject {
             + (result.orphanURLs.isEmpty ? "" : " · \(result.orphanURLs.count) orphan\(result.orphanURLs.count == 1 ? "" : "s")")
         isScanning = false
         Persistence.saveCachedLibrary(items)
+        updateSourceWatcher()
+
+        if pendingSourceChangeRescan {
+            pendingSourceChangeRescan = false
+            scheduleSourceChangeRescan()
+        }
+    }
+
+    private var scanRoots: [URL] {
+        visibleDefaultSources + customScanPaths
+    }
+
+    private func updateSourceWatcher() {
+        sourceWatcher.start(roots: scanRoots) { [weak self] in
+            self?.scheduleSourceChangeRescan()
+        }
+    }
+
+    private func scheduleSourceChangeRescan() {
+        sourceChangeDebounceTask?.cancel()
+        sourceChangeDebounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard !Task.isCancelled else { return }
+            if self.isScanning {
+                self.pendingSourceChangeRescan = true
+                return
+            }
+            self.scanStatus = "Font source changed; rescanning…"
+            await self.rescan()
+        }
     }
 
     // MARK: - Derived data
@@ -372,13 +412,58 @@ final class FontLibrary: ObservableObject {
         return collection.fontIDs.allSatisfy { activeFontIDs.contains($0) }
     }
 
-    /// Returns true if the cache predates a field we now rely on (e.g. foundry).
-    /// We detect this by checking whether every single item has the fallback value —
-    /// which is virtually impossible for a real library scanned with the current
-    /// scanner, but is exactly what happens after decoding a pre-foundry cache.
-    private static func cacheLooksStale(_ cached: [FontItem]) -> Bool {
-        guard cached.count >= 20 else { return false }  // too small to judge
-        return cached.allSatisfy { $0.foundry == "Unknown" }
+    /// Returns true if the cache predates fields we rely on or if scanned
+    /// source folders changed while the app was not running.
+    private static func cacheLooksStale(_ cached: [FontItem], roots: [URL]) -> Bool {
+        if cached.count >= 20, cached.allSatisfy({ $0.foundry == "Unknown" }) {
+            return true
+        }
+
+        let sourceRoots = normalizedScanRootPaths(for: roots)
+        let currentFiles = FontScanner.fontFileURLs(roots: roots)
+        let currentPaths = Set(currentFiles.map(\.path))
+        let cachedPaths = Set(
+            cached
+                .map { $0.fileURL.standardizedFileURL.path }
+                .filter { isPath($0, inAnyOf: sourceRoots) }
+        )
+
+        if !cachedPaths.subtracting(currentPaths).isEmpty {
+            return true
+        }
+
+        guard let cacheDate = Persistence.cacheModificationDate else {
+            return true
+        }
+
+        return currentFiles.contains { url in
+            guard let values = try? url.resourceValues(forKeys: [
+                .contentModificationDateKey,
+                .creationDateKey
+            ]) else {
+                return false
+            }
+            let changedAt = max(
+                values.contentModificationDate ?? .distantPast,
+                values.creationDate ?? .distantPast
+            )
+            return changedAt > cacheDate
+        }
+    }
+
+    private static func normalizedScanRootPaths(for roots: [URL]) -> [String] {
+        roots.map { rawRoot in
+            let root = RightFontImporter.isLibrary(rawRoot)
+                ? RightFontImporter.fontsRoot(in: rawRoot)
+                : rawRoot
+            return root.standardizedFileURL.path
+        }
+    }
+
+    private static func isPath(_ path: String, inAnyOf roots: [String]) -> Bool {
+        roots.contains { root in
+            path == root || path.hasPrefix(root + "/")
+        }
     }
 
     private func reapplyActivations() async {
@@ -389,12 +474,14 @@ final class FontLibrary: ObservableObject {
 
     // MARK: - Collections (projects + palettes)
 
-    func addCollection(name: String, kind: FontCollection.Kind, colorHex: String = "#7DD3FC") {
+    @discardableResult
+    func addCollection(name: String, kind: FontCollection.Kind, colorHex: String = "#7DD3FC") -> UUID {
         let c = FontCollection(name: name, kind: kind, colorHex: colorHex)
         collections.append(c)
         sidebarSelection = .collection(c.id)
         invalidateDerived()
         persist()
+        return c.id
     }
 
     func deleteCollection(_ id: UUID) {
@@ -424,6 +511,139 @@ final class FontLibrary: ObservableObject {
         collections[idx].fontIDs.subtract(fontIDs)
         invalidateDerived()
         persist()
+    }
+
+    func openDocumentFontImporter(targetProjectID: UUID? = nil) {
+        documentFontImportTargetProjectID = targetProjectID
+        sidebarSelection = .tool(.documentFonts)
+    }
+
+    // MARK: - Document font imports
+
+    struct DocumentFontImportReport {
+        let sourceName: String
+        let projectName: String
+        let requestedReferences: [DocumentFontReference]
+        let matchedReferences: [DocumentFontReference]
+        let missingReferences: [DocumentFontReference]
+        let matchedItems: [FontItem]
+        let addedCount: Int
+        let alreadyPresentCount: Int
+
+        var requestedCount: Int { requestedReferences.count }
+        var matchedFaceCount: Int { matchedItems.count }
+        var missingCount: Int { missingReferences.count }
+    }
+
+    @discardableResult
+    func importDocumentFonts(_ scan: DocumentFontScan,
+                             intoProject projectID: UUID,
+                             selectProjectAfterImport: Bool = true) -> DocumentFontImportReport? {
+        guard let idx = collections.firstIndex(where: {
+            $0.id == projectID && $0.kind == .project
+        }) else { return nil }
+
+        var matchedReferences: [DocumentFontReference] = []
+        var missingReferences: [DocumentFontReference] = []
+        var matchedItemsByID: [String: FontItem] = [:]
+
+        for reference in scan.references {
+            let matches = matchingItems(for: reference)
+            if matches.isEmpty {
+                missingReferences.append(reference)
+            } else {
+                matchedReferences.append(reference)
+                for item in matches {
+                    matchedItemsByID[item.id] = item
+                }
+            }
+        }
+
+        let matchedIDs = Set(matchedItemsByID.keys)
+        let alreadyPresent = matchedIDs.intersection(collections[idx].fontIDs).count
+        let beforeCount = collections[idx].fontIDs.count
+        collections[idx].fontIDs.formUnion(matchedIDs)
+        let addedCount = collections[idx].fontIDs.count - beforeCount
+        let projectName = collections[idx].name
+
+        if !matchedIDs.isEmpty, selectProjectAfterImport {
+            sidebarSelection = .collection(projectID)
+            selectedFontID = matchedItemsByID.values
+                .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+                .first?.id
+        }
+
+        invalidateDerived()
+        persist()
+
+        return DocumentFontImportReport(
+            sourceName: scan.sourceName,
+            projectName: projectName,
+            requestedReferences: scan.references,
+            matchedReferences: matchedReferences,
+            missingReferences: missingReferences,
+            matchedItems: matchedItemsByID.values.sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            },
+            addedCount: addedCount,
+            alreadyPresentCount: alreadyPresent
+        )
+    }
+
+    private func matchingItems(for reference: DocumentFontReference) -> [FontItem] {
+        if let psKey = Self.nameKey(reference.postScriptName), !psKey.isEmpty {
+            let exactPostScript = items.filter {
+                Self.nameKey($0.postScriptName) == psKey
+            }
+            if !exactPostScript.isEmpty { return exactPostScript }
+        }
+
+        guard let familyKey = Self.nameKey(reference.familyName), !familyKey.isEmpty else {
+            return []
+        }
+
+        let familyMatches = items.filter {
+            Self.nameKey($0.familyName) == familyKey
+        }
+        guard !familyMatches.isEmpty else { return [] }
+
+        if let styleKey = Self.styleKey(reference.styleName), !styleKey.isEmpty {
+            let exactStyle = familyMatches.filter {
+                Self.styleKey($0.styleName) == styleKey
+            }
+            if !exactStyle.isEmpty { return exactStyle }
+        }
+
+        // If the source only gave us a family, avoid adding an entire large
+        // family by accident. Single-face families are safe to resolve.
+        return familyMatches.count == 1 ? familyMatches : []
+    }
+
+    private static func nameKey(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let folded = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+        return folded.isEmpty ? nil : folded
+    }
+
+    private static func styleKey(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let folded = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+        let compact = folded.unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map(String.init)
+            .joined()
+        switch compact {
+        case "", "regular", "normal", "roman", "plain":
+            return "regular"
+        default:
+            return compact
+        }
     }
 
     // MARK: - Tools: orphans
@@ -562,6 +782,7 @@ final class FontLibrary: ObservableObject {
     func removeCustomScanPath(_ url: URL) {
         customScanPaths.removeAll { $0 == url }
         persist()
+        Task { await rescan() }
     }
 
     // MARK: - RightFont library import
@@ -865,6 +1086,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
     case duplicates
     case organize
     case proofSheet
+    case documentFonts
     case orphans
     case missingRefs
     case largeFiles
@@ -876,6 +1098,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
         case .duplicates:  return "Find Duplicates"
         case .organize:    return "Organize"
         case .proofSheet:  return "Proof Sheet"
+        case .documentFonts: return "Document Fonts"
         case .orphans:     return "Orphan Files"
         case .missingRefs: return "Missing References"
         case .largeFiles:  return "Largest Files"
@@ -887,6 +1110,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
         case .duplicates:  return "doc.on.doc"
         case .organize:    return "folder.badge.gearshape"
         case .proofSheet:  return "text.word.spacing"
+        case .documentFonts: return "doc.text.magnifyingglass"
         case .orphans:     return "doc.badge.ellipsis"
         case .missingRefs: return "link.badge.plus"
         case .largeFiles:  return "arrow.up.arrow.down.circle"
@@ -898,6 +1122,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
         case .duplicates:  return .orange
         case .organize:    return .teal
         case .proofSheet:  return .pink
+        case .documentFonts: return .orange
         case .orphans:     return .gray
         case .missingRefs: return .indigo
         case .largeFiles:  return .blue

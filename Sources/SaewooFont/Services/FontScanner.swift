@@ -96,6 +96,10 @@ enum FontScanner {
         }
     }
 
+    static func fontFileURLs(roots: [URL]) -> [URL] {
+        collectFiles(in: roots).map { $0.standardizedFileURL }
+    }
+
     private static func collectFiles(in roots: [URL]) -> [URL] {
         let fm = FileManager.default
         var files: [URL] = []

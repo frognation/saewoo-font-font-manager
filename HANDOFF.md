@@ -10,6 +10,48 @@ future sessions can start from `main` unless the user asks for a feature branch.
 
 ---
 
+## Session 4 — 2026-04-27/29 (compA)
+
+Synced compA to `origin/main` (fast-forward, 4 commits from Session 3).
+Then added two new features:
+
+| Commit | Summary |
+|--------|---------|
+| *(this commit)* | Document Fonts tool + FSEvents auto-rescan + cache staleness improvement |
+
+### Document Fonts tool
+
+New tool sidebar entry **"Document Fonts"** (icon `doc.richtext`).
+
+**`DocumentFontImporter.swift`** — three import paths:
+- **Figma** — REST API (`/v1/files/{key}`) with personal access token. Recursively walks node tree, harvests `FontName` objects, returns `[DocumentFontReference]`.
+- **Illustrator (AppleScript)** — fires the `app("Adobe Illustrator").documents[0].textFrames` JXA/OSA path, extracts all text fonts, no token needed.
+- **Manual paste** — user pastes one PostScript/family name per line; importer parses the text directly.
+
+**`DocumentFontsView.swift`** — full tool UI:
+- Tabs: Figma · Illustrator · Manual
+- Target Project picker (only Projects shown, not Palettes)
+- Per-mode import form with loading spinner
+- Result banner: `N fonts found · M matched · P added · Q already present · R missing`
+- Missing fonts section with "Copy missing names" button
+
+**`FontLibrary.importDocumentFonts(_:intoProject:)`** — matches `DocumentFontReference` against library by PostScript name first, then family+style. Adds matched faces to the target Project. Returns a `DocumentFontImportReport`.
+
+**Sidebar integration:**
+- Right-click on any Project → "Add Fonts from Illustrator Document" (one-click, no UI)
+- Right-click on any Project → "Open Document Fonts Importer" (opens full tool, pre-selects that Project)
+
+### FSEvents auto-rescan (`FontSourceWatcher.swift`)
+
+`FSEventStreamRef`-backed watcher registered on `scanRoots`. When any file in a scan root changes, fires a 700 ms debounced rescan. If a rescan is already running, sets `pendingSourceChangeRescan` flag and re-triggers after the current scan completes.
+
+### Cache staleness improvement
+
+`cacheLooksStale` now also checks whether cached file paths still exist on disk relative to current scan roots. If source folders were added/removed while the app was closed, the cache is treated as stale and a fresh scan kicks off automatically.
+`FontScanner.fontFileURLs(roots:)` public wrapper exposes the file enumeration used by this check.
+
+---
+
 ## Session 3 — merged to `main`
 
 `main` now includes the Session 2 branch plus two follow-up commits:
