@@ -164,13 +164,25 @@ final class FontLibrary: ObservableObject {
         var filesToParse: [URL]      = []
 
         for (url, mtime, size) in currentStats {
-            let path = url.path
-            if let snap = snapshotMap[path],
+            let path  = url.path
+            let snap  = snapshotMap[path]
+            let cache = existingByPath[path]
+
+            if let snap,
                snap.mtime == mtime.timeIntervalSinceReferenceDate,
                snap.size  == size,
-               let cached = existingByPath[path], !cached.isEmpty {
-                reused.append(contentsOf: cached)
+               let cache, !cache.isEmpty {
+                // Snapshot confirms file is unchanged — reuse cached items.
+                reused.append(contentsOf: cache)
+            } else if snap == nil, let cache, !cache.isEmpty {
+                // No snapshot yet (e.g. first run after the perf upgrade or
+                // after a manual cache clear). We have in-memory data for this
+                // file, so trust it — this avoids a full re-parse on migration.
+                // The snapshot written at the end of this scan will capture the
+                // current mtime/size, so next time we do proper diff checks.
+                reused.append(contentsOf: cache)
             } else {
+                // File is new, changed, or has no cached data — must re-parse.
                 filesToParse.append(url)
             }
         }
