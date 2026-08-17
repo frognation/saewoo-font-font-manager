@@ -414,8 +414,9 @@ struct OrganizeView: View {
 
     private func filteredItems() -> [FontItem] {
         guard let src = sourceURL else { return [] }
-        let srcPath = src.standardizedFileURL.path
-        let base = lib.items.filter { $0.fileURL.standardizedFileURL.path.hasPrefix(srcPath) }
+        // Goes through the shared source buckets; item URLs are already
+        // standardized at scan time, so no per-element normalization here.
+        let base = lib.itemsInSource(src)
         return base.filter { item in
             if skipSystemEssentials, FontLibrary.isSystemEssential(item) { return false }
             if skipActive, lib.isActive(item) { return false }

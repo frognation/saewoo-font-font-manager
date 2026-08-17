@@ -16,7 +16,7 @@ enum FontClassifier {
                          traits: CTFontSymbolicTraits,
                          weight: Double,
                          slant: Double,
-                         panose: [Int]) -> ([FontCategory], [FontMood]) {
+                         panose: [UInt8]) -> ([FontCategory], [FontMood]) {
 
         let tokens = tokenize("\(family) \(style) \(psName)")
         let categories = categorize(traits: traits, tokens: tokens, panose: panose)
@@ -33,7 +33,7 @@ enum FontClassifier {
     /// adds an additional orthogonal tag if the traits or name say so.
     private static func categorize(traits: CTFontSymbolicTraits,
                                    tokens: Set<String>,
-                                   panose: [Int]) -> [FontCategory] {
+                                   panose: [UInt8]) -> [FontCategory] {
         var result: Set<FontCategory> = []
 
         // Orthogonal: monospace is independent of shape. Add it if traits say
@@ -96,7 +96,7 @@ enum FontClassifier {
                                  tokens: Set<String>,
                                  weight: Double,
                                  slant: Double,
-                                 panose: [Int]) -> [FontMood] {
+                                 panose: [UInt8]) -> [FontMood] {
         var moods: Set<FontMood> = []
 
         if weight >= 0.5 { moods.insert(.bold) }

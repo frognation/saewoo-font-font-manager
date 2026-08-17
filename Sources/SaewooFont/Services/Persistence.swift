@@ -28,8 +28,21 @@ enum Persistence {
     }
 
     static func loadCachedLibrary() -> [FontItem]? {
-        guard let data = try? Data(contentsOf: cacheURL) else { return nil }
-        return try? JSONDecoder().decode([FontItem].self, from: data)
+        // autoreleasepool: JSONDecoder goes through NSJSONSerialization, which
+        // leaves a large graph of autoreleased temporaries behind. Without the
+        // pool they survive until the enclosing task drains, roughly doubling
+        // peak footprint on a 60 MB cache.
+        autoreleasepool {
+            guard let data = try? Data(contentsOf: cacheURL) else { return nil }
+            return try? JSONDecoder().decode([FontItem].self, from: data)
+        }
+    }
+
+    /// Off-main-actor variant. Decoding the reference library takes ~1.3 s;
+    /// doing that inside `@MainActor bootstrap()` froze the window before it
+    /// ever drew.
+    static func loadCachedLibraryOffMain() async -> [FontItem]? {
+        await Task.detached(priority: .userInitiated) { loadCachedLibrary() }.value
     }
 
     static func saveCachedLibrary(_ items: [FontItem]) {

@@ -327,12 +327,12 @@ struct SidebarView: View {
     /// True if any default source is hidden — either explicitly or implicitly (<2 fonts).
     private var hasAutoOrManuallyHidden: Bool {
         if !lib.hiddenDefaultSources.isEmpty { return true }
-        return lib.visibleDefaultSources.contains { lib.itemsInSource($0).count < 2 }
+        return !lib.autoHiddenDefaultSources.isEmpty
     }
 
     @ViewBuilder
     private func sourceRow(_ url: URL, removable: Bool) -> some View {
-        let count = lib.itemsInSource(url).count
+        let count = lib.itemCountInSource(url)
         let isRFLibrary = RightFontImporter.isLibrary(url)
         // RightFont libraries get a briefcase icon + purple tint so they
         // stand out from plain folders at a glance.
@@ -413,7 +413,7 @@ struct SidebarView: View {
     }
 
     private var hiddenSourcesMenu: some View {
-        let auto = lib.visibleDefaultSources.filter { lib.itemsInSource($0).count < 2 }
+        let auto = lib.autoHiddenDefaultSources
         let manual = Array(lib.hiddenDefaultSources).map { URL(fileURLWithPath: $0) }
         let all = (auto + manual).sorted { $0.path < $1.path }
 
@@ -441,9 +441,7 @@ struct SidebarView: View {
 
     @ViewBuilder
     private func foundryRow(name: String, count: Int) -> some View {
-        let faces = lib.itemsInFoundry(name)
-        let allActive = !faces.isEmpty && faces.allSatisfy { lib.isActive($0) }
-        let anyActive = faces.contains { lib.isActive($0) }
+        let (allActive, anyActive) = lib.foundryActivation(name)
         HStack(spacing: 10) {
             Image(systemName: "building.2")
                 .font(.system(size: 14))
@@ -452,7 +450,7 @@ struct SidebarView: View {
             Text(name).font(.system(size: 13)).lineLimit(1)
             Spacer(minLength: 4)
             Button {
-                Task { await lib.setActiveMany(faces, active: !allActive) }
+                Task { await lib.setActiveMany(lib.itemsInFoundry(name), active: !allActive) }
             } label: {
                 Circle()
                     .fill(allActive ? Color.green : (anyActive ? Color.yellow : Color.secondary.opacity(0.3)))
@@ -470,10 +468,10 @@ struct SidebarView: View {
         .tag(SidebarItem.foundry(name))
         .contextMenu {
             Button("Activate All from \(name)") {
-                Task { await lib.setActiveMany(faces, active: true) }
+                Task { await lib.setActiveMany(lib.itemsInFoundry(name), active: true) }
             }
             Button("Deactivate All from \(name)") {
-                Task { await lib.setActiveMany(faces, active: false) }
+                Task { await lib.setActiveMany(lib.itemsInFoundry(name), active: false) }
             }
         }
     }

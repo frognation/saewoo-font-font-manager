@@ -186,7 +186,11 @@ enum FontScanner {
         return out
     }
 
-    private static func buildItem(from desc: CTFontDescriptor, url: URL, fileSize: Int64, dateAdded: Date) -> FontItem? {
+    private static func buildItem(from desc: CTFontDescriptor, url rawURL: URL, fileSize: Int64, dateAdded: Date) -> FontItem? {
+        // Standardize exactly once, here. Everything downstream (source
+        // bucketing, duplicate detection, Organize) then compares raw `.path`,
+        // which is ~8× cheaper than re-standardizing per element per render.
+        let url = rawURL.standardizedFileURL
         let font = CTFontCreateWithFontDescriptor(desc, 14, nil)
         let psName = CTFontCopyPostScriptName(font) as String
         let family = (CTFontCopyName(font, kCTFontFamilyNameKey) as String?) ?? "Unknown"
@@ -229,17 +233,8 @@ enum FontScanner {
         )
     }
 
-    private static func detectFormat(url: URL, traits: CTFontSymbolicTraits) -> String {
-        switch url.pathExtension.lowercased() {
-        case "otf": return "OpenType PostScript"
-        case "ttf": return "TrueType"
-        case "ttc": return "TrueType Collection"
-        case "otc": return "OpenType Collection"
-        case "dfont": return "Datafork TrueType"
-        case "woff": return "WOFF"
-        case "woff2": return "WOFF2"
-        default: return "Unknown"
-        }
+    private static func detectFormat(url: URL, traits: CTFontSymbolicTraits) -> FontFormat {
+        FontFormat(fileExtension: url.pathExtension)
     }
 }
 
@@ -355,11 +350,11 @@ private extension Double {
 
 enum PanoseReader {
     /// Reads the 10-byte PANOSE classification from the OS/2 table, if present.
-    static func read(font: CTFont) -> [Int] {
+    static func read(font: CTFont) -> [UInt8] {
         guard let data = CTFontCopyTable(font, CTFontTableTag(kCTFontTableOS2), []) as Data? else { return [] }
         // OS/2 table: panose begins at offset 32, 10 bytes.
         guard data.count >= 42 else { return [] }
-        return (32..<42).map { Int(data[$0]) }
+        return (32..<42).map { data[$0] }
     }
 }
 

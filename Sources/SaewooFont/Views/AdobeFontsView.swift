@@ -10,6 +10,7 @@ import AppKit
 /// a friendlier header, plus a helpful empty state when CC isn't installed.
 struct AdobeFontsView: View {
     @EnvironmentObject var lib: FontLibrary
+    @EnvironmentObject var sel: SelectionModel
 
     private var cacheURL: URL? { FontScanner.adobeFontsCacheURL }
 
@@ -171,8 +172,8 @@ struct AdobeFontsView: View {
         }
         .padding(.horizontal, 16).padding(.vertical, 8)
         .contentShape(Rectangle())
-        .onTapGesture { lib.selectedFontID = item.id }
-        .background(lib.selectedFontID == item.id ? Color.accentColor.opacity(0.1) : .clear)
+        .onTapGesture { sel.selectedFontID = item.id }
+        .background(sel.selectedFontID == item.id ? Color.accentColor.opacity(0.1) : .clear)
     }
 
     private func openCreativeCloud() {

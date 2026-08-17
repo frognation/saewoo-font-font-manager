@@ -11,13 +11,35 @@ struct SaewooFontApp: App {
     // cursor but keyboard events never reach their first responder.
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var library = FontLibrary()
+    @StateObject private var selection = SelectionModel()
+    @StateObject private var preview = PreviewSettings()
+
+    init() {
+        // Headless perf harness — runs before any window is created so the
+        // numbers aren't polluted by SwiftUI setup. See Benchmark.swift.
+        if Benchmark.shouldRun() {
+            MainActor.assumeIsolated { Benchmark.run() }
+            exit(0)
+        }
+    }
 
     var body: some Scene {
         WindowGroup("Saewoo Font") {
             ContentView()
                 .environmentObject(library)
+                .environmentObject(selection)
+                .environmentObject(preview)
                 .frame(minWidth: 1100, minHeight: 680)
-                .task { await library.bootstrap() }
+                .task {
+                    await library.bootstrap()
+                    // Seed the live preview state from persisted prefs, then
+                    // route future edits back for persistence.
+                    preview.text = library.previewText
+                    preview.size = library.previewSize
+                    preview.onCommit = { [weak library] text, size in
+                        library?.updatePreviewPrefs(text: text, size: size)
+                    }
+                }
         }
         .windowStyle(.titleBar)
         .commands {

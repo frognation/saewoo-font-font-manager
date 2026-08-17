@@ -7,28 +7,34 @@ struct FontListView: View {
 
     var body: some View {
         let groups = lib.familyGroups
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(groups) { group in
-                    FamilyGroupRow(group: group,
-                                   expanded: expandedFamilies.contains(group.key),
-                                   toggleExpand: {
-                                       if expandedFamilies.contains(group.key) {
-                                           expandedFamilies.remove(group.key)
-                                       } else {
-                                           expandedFamilies.insert(group.key)
-                                       }
-                                   })
-                    Divider().opacity(0.4)
-                }
+        // `List` (NSTableView-backed) recycles rows. The previous
+        // ScrollView+LazyVStack realized a row on first scroll-past and never
+        // released it, so scrolling 4 000+ families grew memory monotonically.
+        List {
+            ForEach(groups) { group in
+                FamilyGroupRow(group: group,
+                               expanded: expandedFamilies.contains(group.key),
+                               toggleExpand: {
+                                   if expandedFamilies.contains(group.key) {
+                                       expandedFamilies.remove(group.key)
+                                   } else {
+                                       expandedFamilies.insert(group.key)
+                                   }
+                               })
+                    .listRowInsets(EdgeInsets())
+                    .listRowSeparator(.visible)
             }
         }
+        .listStyle(.plain)
+        .environment(\.defaultMinListRowHeight, 1)
         .background(Color(NSColor.textBackgroundColor))
     }
 }
 
 struct FamilyGroupRow: View {
     @EnvironmentObject var lib: FontLibrary
+    @EnvironmentObject var sel: SelectionModel
+    @EnvironmentObject var preview: PreviewSettings
     let group: FontFamilyGroup
     let expanded: Bool
     let toggleExpand: () -> Void
@@ -53,7 +59,7 @@ struct FamilyGroupRow: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(width: 70, alignment: .leading)
 
-                FontPreviewText(item: primary, size: lib.previewSize, text: lib.previewText)
+                FontPreviewText(item: primary, size: preview.size, text: preview.text)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -68,9 +74,9 @@ struct FamilyGroupRow: View {
             .padding(.horizontal, 14).padding(.vertical, 6)
             .contentShape(Rectangle())
             .onTapGesture {
-                lib.selectedFontID = primary.id
+                sel.selectedFontID = primary.id
             }
-            .background(lib.selectedFontID == primary.id ? Color.accentColor.opacity(0.12) : Color.clear)
+            .background(sel.selectedFontID == primary.id ? Color.accentColor.opacity(0.12) : Color.clear)
             .contextMenu { rowContextMenu(items: group.faces) }
 
             if expanded {
@@ -138,6 +144,8 @@ struct FamilyGroupRow: View {
 
 struct FaceRow: View {
     @EnvironmentObject var lib: FontLibrary
+    @EnvironmentObject var sel: SelectionModel
+    @EnvironmentObject var preview: PreviewSettings
     let item: FontItem
 
     var body: some View {
@@ -154,7 +162,7 @@ struct FaceRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 160, alignment: .leading)
 
-            FontPreviewText(item: item, size: lib.previewSize * 0.85, text: lib.previewText)
+            FontPreviewText(item: item, size: preview.size * 0.85, text: preview.text)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -168,8 +176,8 @@ struct FaceRow: View {
         }
         .padding(.horizontal, 14).padding(.vertical, 4)
         .contentShape(Rectangle())
-        .background(lib.selectedFontID == item.id ? Color.accentColor.opacity(0.12) : Color.clear)
-        .onTapGesture { lib.selectedFontID = item.id }
+        .background(sel.selectedFontID == item.id ? Color.accentColor.opacity(0.12) : Color.clear)
+        .onTapGesture { sel.selectedFontID = item.id }
     }
 }
 
@@ -201,13 +209,44 @@ final class FontPreviewCache {
     static let shared = FontPreviewCache()
 
     /// NSCache gives us automatic LRU-ish eviction once we exceed `countLimit`,
-    /// and is thread-safe. 1000 cached NSFonts is enough to cover a typical
-    /// visible list without unbounded memory growth over a long session.
+    /// and is thread-safe. Sized to comfortably cover a scrolled-through list
+    /// on a large library — at 1000 it thrashed against 4 000+ families.
     private let cache: NSCache<NSString, NSFont> = {
         let c = NSCache<NSString, NSFont>()
-        c.countLimit = 1000
+        c.countLimit = 4000
         return c
     }()
+
+    /// Boxes an *optional* descriptor so failures are negative-cached too —
+    /// otherwise an unreadable face re-parses from disk on every render.
+    private final class DescriptorBox {
+        let descriptor: CTFontDescriptor?
+        init(_ d: CTFontDescriptor?) { descriptor = d }
+    }
+
+    /// Descriptors keyed by file+face, independent of size.
+    ///
+    /// This is the important one. Inactive fonts miss the `NSFont(name:)` fast
+    /// path, so the old code re-ran `CTFontManagerCreateFontDescriptorsFromURL`
+    /// — a synchronous disk read and parse, inside a SwiftUI body — on every
+    /// cache miss. Dragging the preview-size slider changed the cache key, so
+    /// each tick re-parsed every visible font file.
+    private let descriptors: NSCache<NSString, DescriptorBox> = {
+        let c = NSCache<NSString, DescriptorBox>()
+        c.countLimit = 4000
+        return c
+    }()
+
+    private func descriptor(for item: FontItem) -> CTFontDescriptor? {
+        let key = "\(item.fileURL.path)::\(item.postScriptName)" as NSString
+        if let box = descriptors.object(forKey: key) { return box.descriptor }
+        let descs = CTFontManagerCreateFontDescriptorsFromURL(item.fileURL as CFURL) as? [CTFontDescriptor]
+        let found = descs?.first(where: { d in
+            (CTFontDescriptorCopyAttribute(d, kCTFontNameAttribute) as? String) == item.postScriptName
+        }) ?? descs?.first
+        descriptors.setObject(DescriptorBox(found), forKey: key)
+        return found
+    }
 
     func font(for item: FontItem, size: CGFloat, variations: [UInt32: Double]? = nil) -> NSFont? {
         let varKey = variations.map { dict in
@@ -225,13 +264,9 @@ final class FontPreviewCache {
             return f
         }
 
-        // Variation path (or fallback): build from URL descriptors so we can attach axis values.
-        let descs = CTFontManagerCreateFontDescriptorsFromURL(item.fileURL as CFURL) as? [CTFontDescriptor]
-        guard var desc = descs?.first(where: { d in
-            (CTFontDescriptorCopyAttribute(d, kCTFontNameAttribute) as? String) == item.postScriptName
-        }) ?? descs?.first else {
-            return nil
-        }
+        // Variation path (or fallback): descriptor comes from the size-independent
+        // cache, so a size change never re-reads the file.
+        guard var desc = descriptor(for: item) else { return nil }
         if let v = variations, !v.isEmpty {
             var dict: [NSNumber: NSNumber] = [:]
             for (tag, value) in v {

@@ -10,6 +10,136 @@ future sessions can start from `main` unless the user asks for a feature branch.
 
 ---
 
+## Session 4 — 2026-08-16 · performance pass #3 (uncommitted)
+
+Triggered by "무겁고 느린 게 젤 큰 문제". Everything below is **working-tree
+only — not committed yet**. `swift build -c release` is clean; the app launches,
+idles at 0 % CPU, and the benchmark harness is committed alongside so the next
+session can re-verify before touching anything.
+
+### Reference machine
+
+`~/Library/Fonts` holds 6 904 files, which expand to **77 837 faces / 4 136
+families / 546 foundries**. The old `library-cache.json` was 60 MB. Every number
+below is a **release** build on that library — debug numbers are meaningless here.
+
+### New: `--bench` harness (`Services/Benchmark.swift`)
+
+```bash
+swift build -c release && ./.build/arm64-apple-macosx/release/SaewooFont --bench
+```
+
+Runs headless before any window is created (hooked from `SaewooFontApp.init()`)
+and prints a table of the paths that dominate perceived latency. `FontLibrary`
+gained three `…ForBenchmark` methods so the harness can install items and force
+cold caches without touching disk or Core Text. **Keep the harness in sync with
+what the views actually call** — the `sourcesSection` measurement is a hand-written
+mirror of `SidebarView.sourcesSection`, so if that view changes, change this too
+or the number silently starts lying.
+
+### The actual bug
+
+`SidebarView.sourcesSection` called `itemsInSource()` about **nine times per body
+evaluation**, and `itemsInSource` filtered all 77 837 items while calling
+`standardizedFileURL` on each one (419 ms per pass, vs 54 ms for raw `.path`).
+
+That alone was **6 775 ms per sidebar render**. And because `searchInput` was
+`@Published` on `FontLibrary` — which all 14 views observe via
+`@EnvironmentObject` — *every keystroke* re-evaluated that body. Typing one
+character cost ~7 s. The 180 ms search debounce added in Session 2 was
+therefore dead code: it debounced `searchQuery`, but publishing `searchInput`
+had already invalidated the whole UI.
+
+### Results
+
+| path | before | after |
+|------|--------|-------|
+| full `sourcesSection` (~9 passes) | 6 775.0 ms | **0.1 ms** |
+| `displayableDefaultSources` | 1 696.4 ms | **0.0 ms** |
+| 30 visible foundry rows | 252.9 ms | **9.1 ms** |
+| `toggleFavorite` → next sidebar render | 169.9 ms | **6.6 ms** |
+| search commit + regroup | 196.9 ms | 172.2 ms |
+| cache decode (launch) | 1 313.7 ms | 1 227.4 ms, now **off the main actor** |
+| cache encode (delete/move) | 1 016.6 ms | 977.9 ms, now **debounced + detached** |
+| settled `phys_footprint` | 437 MB | **364 MB** |
+| peak `phys_footprint` | 549 MB | **712 MB** ⚠️ regression, see below |
+
+### What changed
+
+1. **Source/foundry buckets** (`FontLibrary`). `itemsInSource` / `itemsInFoundry`
+   are now dictionary lookups built in one pass and cached by `derivedVersion`.
+   Buckets store **indices, not `FontItem` copies** — a struct-copy bucket map
+   duplicates ~17 MB per map at this library size. Added `itemCountInSource`
+   (the sidebar only ever needed counts) and `foundryActivation` (computes
+   all/any-active off indices so 546 rows never materialize item arrays).
+2. **URLs standardized once, at scan time** (`FontScanner.buildItem`). Everything
+   downstream compares raw `.path`.
+3. **`@Published` churn split out** (new `Services/UIState.swift`).
+   `SelectionModel` owns `selectedFontID`; `PreviewSettings` owns preview text +
+   size with a 400 ms coalesced save; the search field owns its text as plain
+   `@State`. `FontLibrary` no longer publishes any of them, so slider drags,
+   row taps and keystrokes cannot invalidate the sidebar.
+4. **Invalidation split**: `invalidateDerived()` (items changed → clear
+   everything) vs `invalidateMembership()` (favorites/collections/instances →
+   clear only `missingRefs`). Starring a font used to recompute `duplicateGroups`,
+   `itemsByFileSize` and `foundryCounts` for no reason.
+5. **Cache I/O off the main actor**: `loadCachedLibraryOffMain()` at bootstrap;
+   `scheduleCacheSave()` (800 ms debounce, detached) for delete/move;
+   `saveCacheNow()` on rescan completion.
+6. **`FontItem` shrunk**: `format: String` → `formatKind: FontFormat` (enum),
+   `panose: [Int]` → `[UInt8]`, `displayName` stored only when it differs from
+   the derived "Family Style". Decoding accepts both old and new cache layouts,
+   so **no forced rescan** — and uses `decodeIfPresent` rather than `try?`
+   (a caught throw per absent key across 78 k items is not free; that mistake
+   cost ~90 ms until it was spotted).
+7. **`FontListView` uses `List`** instead of `ScrollView` + `LazyVStack`, which
+   never released realized rows.
+8. **`FontPreviewCache` descriptor cache**: `CTFontDescriptor`s are now cached
+   per file+face, independent of size, with failures negative-cached. Previously
+   an *inactive* font missed the `NSFont(name:)` fast path and re-parsed its file
+   from disk inside a SwiftUI body on every cache miss — so dragging the preview
+   size slider re-read every visible font file on every tick.
+9. **`migrateReferences` — data-loss fix.** `FontItem.id` hashes the absolute
+   path, so Organize's move changed it. `moveFontFile` patched the in-memory
+   record, but the *next rescan* regenerated the ID from the new path and
+   silently dropped the font out of every Favorite / Project / Palette. Rescan
+   now remaps references using an identity that survives a move
+   (PostScript name + filename + byte size), skipping ambiguous matches.
+
+### Known issues from this session
+
+- ⚠️ **Peak footprint regressed 549 → 712 MB.** Settled memory improved, but
+  launch peak is worse: the cache decode now runs on a background thread
+  *concurrently* with SwiftUI building the UI, instead of blocking the main
+  thread until it finished. An `autoreleasepool` around the decode was tried
+  and did not help. The real fix is to stop shipping a 60 MB JSON blob —
+  a binary/streaming format (or SQLite) would cut decode time, peak memory and
+  file size together. **This is the single highest-value next perf task.**
+- ⚠️ **`WARNING: Application performed a reentrant operation in its NSTableView
+  delegate`** appears once at launch, new with the `List` change in
+  `FontListView`. Harmless today; the message says it will become an assert in
+  a future macOS. Worth tracking down before it does.
+- `search commit` (172 ms) is now dominated by `familyGroups` regrouping
+  (`Dictionary(grouping:)` + sort over 4 136 families), not by filtering.
+  It runs once per debounce pause, not per keystroke.
+
+### Audited but not changed
+
+A read-only pass over the remaining views found these; none were touched:
+
+- `ProofSheetView.swift:370,447` — `supportedCharacters()` reaches
+  `CTFontManagerCreateFontDescriptorsFromURL` from inside a `@ViewBuilder`,
+  i.e. synchronous font parsing during body evaluation.
+- `ProofSheetView.swift:146` — `ForEach(lib.items)` builds a menu over the
+  entire library.
+- `InspectorView.swift:9`, `ProofSheetView.swift:71` — `lib.items.first(where:)`
+  linear scan in `body`; wants an id→item dictionary.
+- `DuplicatesView.swift:224+` — `group.max { … } ?? group[0]` crashes on an
+  empty group. Unreachable today (`duplicateGroups` only yields count > 1
+  groups) but a latent trap.
+
+---
+
 ## Session 3 — merged to `main`
 
 `main` now includes the Session 2 branch plus two follow-up commits:
@@ -373,11 +503,28 @@ Sources/SaewooFont/
 ### Critical invariants
 - **FontItem.id** = `SHA.short("\(fileURL.path)::\(postScriptName)")`. Moving a
   file changes its ID — `moveFontFile` preserves the old ID by replacing the
-  stored `FontItem` in place instead of regenerating.
-- **Derived caches must be invalidated** on every mutation that affects them.
-  Search `invalidateDerived()` — call sites are `rescan`, `bootstrap`, `deleteFontFile`,
-  `moveFontFile`, `toggleFavorite`, collection mutations, variable-instance
-  mutations, `cleanupMissingReferences`.
+  stored `FontItem` in place instead of regenerating. That is not sufficient on
+  its own: the next `rescan()` regenerates IDs from disk, so `migrateReferences`
+  (Session 4) re-points favorites / collections / instances using
+  PostScript name + filename + byte size. **Don't remove it** without changing
+  how IDs are derived.
+- **Item `fileURL`s are standardized at scan time** (`FontScanner.buildItem`).
+  Downstream code must compare raw `.path`; calling `standardizedFileURL` per
+  element in a loop or a view body is an ~8× penalty and is how the sidebar
+  ended up costing 6.8 s per render.
+- **Two invalidation levels** (Session 4). `invalidateDerived()` when `items`
+  changes — clears every cache including the source/foundry buckets and the
+  search index. `invalidateMembership()` for favorites / collections /
+  variable-instance edits — clears only `missingRefs`. Using the heavy one for
+  a membership edit is a correctness-neutral but expensive mistake.
+- **`FontLibrary` must not gain high-frequency `@Published` properties.** All 14
+  views observe it, and SwiftUI has no per-property granularity: one published
+  mutation re-evaluates every observing body. Selection, preview text/size and
+  search text live in `Services/UIState.swift` for exactly this reason.
+- **`FontItem` decoding must stay tolerant** of both old and new cache layouts
+  (`format` as enum rawValue *or* legacy label; absent `displayName`/`panose`).
+  Use `decodeIfPresent`, never `try?`, for optional keys — a caught throw per
+  key across 78 000 items is measurable.
 - **Activation state persistence** uses `activeFontIDs: Set<String>`. On
   bootstrap, `reapplyActivations()` re-registers those URLs so Core Text sees
   them again this session.

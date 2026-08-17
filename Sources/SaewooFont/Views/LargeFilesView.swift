@@ -6,6 +6,7 @@ import AppKit
 /// rise to the top. Multi-select + Trash to reclaim space.
 struct LargeFilesView: View {
     @EnvironmentObject var lib: FontLibrary
+    @EnvironmentObject var sel: SelectionModel
 
     @State private var topN: Int = 50
     @State private var selection: Set<String> = []
@@ -173,7 +174,7 @@ struct LargeFilesView: View {
         .padding(.horizontal, 16).padding(.vertical, 8)
         .background(selection.contains(item.id) ? Color.red.opacity(0.08) : Color.clear)
         .contentShape(Rectangle())
-        .onTapGesture { lib.selectedFontID = item.id }
+        .onTapGesture { sel.selectedFontID = item.id }
     }
 
     private var empty: some View {

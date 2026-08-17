@@ -8,6 +8,7 @@ import AppKit
 /// angle, underline) are always preserved.
 struct ForkView: View {
     @EnvironmentObject var lib: FontLibrary
+    @EnvironmentObject var sel: SelectionModel
 
     // MARK: - Source mode
 
@@ -184,13 +185,13 @@ struct ForkView: View {
     private func resolvedItems() -> [FontItem] {
         switch sourceMode {
         case .selected:
-            if let id = lib.selectedFontID,
+            if let id = sel.selectedFontID,
                let item = lib.items.first(where: { $0.id == id }) {
                 return [item]
             }
             return []
         case .family:
-            guard let id = lib.selectedFontID,
+            guard let id = sel.selectedFontID,
                   let seed = lib.items.first(where: { $0.id == id })
             else { return [] }
             return lib.items

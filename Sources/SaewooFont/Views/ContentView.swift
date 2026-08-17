@@ -62,27 +62,28 @@ struct ContentView: View {
 
 struct TopToolbar: View {
     @EnvironmentObject var lib: FontLibrary
+    @EnvironmentObject var preview: PreviewSettings
+
+    /// The search field owns its text locally. Publishing every keystroke on
+    /// `FontLibrary` used to rebuild all 14 observing views per character.
+    @State private var searchText: String = ""
+
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            // Bind to searchInput (instant, cheap) and debounce to searchQuery
-            // via updateSearchInput so filtering doesn't fire on every key.
-            TextField("Search family, style, postscript…",
-                      text: Binding(
-                          get: { lib.searchInput },
-                          set: { lib.updateSearchInput($0) }
-                      ))
+            TextField("Search family, style, postscript…", text: $searchText)
                 .textFieldStyle(.plain)
+                .onChange(of: searchText) { lib.updateSearchInput($0) }
             Spacer()
-            Slider(value: $lib.previewSize, in: 12...96)
+            Slider(value: $preview.size, in: 12...96)
                 .frame(width: 120)
-                .onChange(of: lib.previewSize) { _ in lib.savePreviewPrefs() }
-            Text("\(Int(lib.previewSize))pt")
+                .onChange(of: preview.size) { _ in preview.scheduleSave() }
+            Text("\(Int(preview.size))pt")
                 .font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
-            TextField("Preview text", text: $lib.previewText)
+            TextField("Preview text", text: $preview.text)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 280)
-                .onChange(of: lib.previewText) { _ in lib.savePreviewPrefs() }
+                .onChange(of: preview.text) { _ in preview.scheduleSave() }
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
     }

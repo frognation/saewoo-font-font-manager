@@ -3,10 +3,12 @@ import AppKit
 
 struct InspectorView: View {
     @EnvironmentObject var lib: FontLibrary
+    @EnvironmentObject var sel: SelectionModel
+    @EnvironmentObject var preview: PreviewSettings
     @State private var playgroundItem: FontItem? = nil
 
     var body: some View {
-        if let id = lib.selectedFontID, let item = lib.items.first(where: { $0.id == id }) {
+        if let id = sel.selectedFontID, let item = lib.items.first(where: { $0.id == id }) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     // Big preview
@@ -15,7 +17,7 @@ struct InspectorView: View {
                         Text(item.postScriptName).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                         FontPreviewText(item: item, size: 48, text: "Aa Bb Cc 123")
                             .frame(maxWidth: .infinity, alignment: .leading)
-                        FontPreviewText(item: item, size: 18, text: lib.previewText)
+                        FontPreviewText(item: item, size: 18, text: preview.text)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         FontPreviewText(item: item, size: 14, text: "abcdefghijklmnopqrstuvwxyz 0123456789")
                             .frame(maxWidth: .infinity, alignment: .leading)

@@ -14,9 +14,17 @@ final class FontLibrary: ObservableObject {
     /// critical for perf: without it, the sidebar re-iterates `items` dozens of
     /// times per keystroke.
     private var derivedVersion: Int = 0
+
+    /// Bumped when favorites / collections / variableInstances change. Kept
+    /// separate from `derivedVersion` on purpose: starring a font must NOT
+    /// invalidate `duplicateGroups`, `itemsByFileSize`, `foundryCounts` or the
+    /// source/foundry buckets, none of which depend on membership. Before this
+    /// split a single star click cost ~170 ms of pure recompute.
+    private var membershipVersion: Int = 0
+
+    /// Full invalidation — only for mutations that change `items` itself.
     private func invalidateDerived() {
         derivedVersion &+= 1
-        // Clear every cache slot. Getters will repopulate lazily.
         categoryCountsCache = nil
         moodCountsCache = nil
         foundryCountsCache = nil
@@ -24,6 +32,18 @@ final class FontLibrary: ObservableObject {
         duplicateGroupsCache = nil
         itemsByFileSizeCache = nil
         missingRefsCache = nil
+        sourceBucketsCache = nil
+        foundryBucketsCache = nil
+        displayableSourcesCache = nil
+        searchIndexCache = nil
+        invalidateDerivedViews()
+    }
+
+    /// Cheap invalidation for favorites / collection / instance edits.
+    private func invalidateMembership() {
+        membershipVersion &+= 1
+        missingRefsCache = nil
+        invalidateDerivedViews()
     }
 
     private var categoryCountsCache: (Int, [(FontCategory, Int)])? = nil
@@ -32,7 +52,17 @@ final class FontLibrary: ObservableObject {
     private var variableCountCache: (Int, Int)? = nil
     private var duplicateGroupsCache: (Int, [(name: String, items: [FontItem])])? = nil
     private var itemsByFileSizeCache: (Int, [FontItem])? = nil
-    private var missingRefsCache: (Int, [MissingReference])? = nil
+    private var missingRefsCache: (derived: Int, membership: Int, refs: [MissingReference])? = nil
+
+    /// Root path → items underneath it, built in a single pass over `items`.
+    /// `itemsInSource` used to re-filter the whole library *and* call
+    /// `standardizedFileURL` on every element — 419 ms a pop, and the sidebar
+    /// called it about nine times per render. Now it is a dictionary lookup.
+    private var sourceBucketsCache: (Int, [String: [Int]])? = nil
+    /// Foundry name → indices of its faces. Same rationale; the sidebar has
+    /// 546 foundry rows.
+    private var foundryBucketsCache: (Int, [String: [Int]])? = nil
+    private var displayableSourcesCache: (Int, [URL])? = nil
 
     @Published var favorites: Set<String> = []
     @Published var collections: [FontCollection] = []
@@ -47,36 +77,49 @@ final class FontLibrary: ObservableObject {
     /// Not cached to disk; rebuilt from the current scan.
     @Published private(set) var orphanURLs: [URL] = []
 
-    @Published var previewText: String = "The quick brown fox jumps over the lazy dog"
-    @Published var previewSize: Double = 36
+    /// Preview prefs are persisted here but are NOT `@Published` — the live,
+    /// high-frequency values live in `PreviewSettings` so that dragging the
+    /// size slider cannot invalidate the sidebar. See `UIState.swift`.
+    private(set) var previewText: String = "The quick brown fox jumps over the lazy dog"
+    private(set) var previewSize: Double = 36
+
+    func updatePreviewPrefs(text: String, size: Double) {
+        previewText = text
+        previewSize = size
+        persist()
+    }
 
     // MARK: - Selection
 
     @Published var sidebarSelection: SidebarItem = .allFonts
-    @Published var selectedFontID: String? = nil
 
-    /// What the user is currently typing. Bound to the search text field so
-    /// every keystroke only updates this one tiny string — no derived data
-    /// is recomputed. Fast to redraw.
-    @Published var searchInput: String = ""
-
-    /// What the family list actually filters on. Updated from `searchInput`
-    /// after a short debounce so that 45 000 fonts aren't re-scanned on
-    /// every keystroke.
+    /// What the family list actually filters on. Updated from the search field
+    /// after a short debounce so that 78 000 faces aren't re-scanned on every
+    /// keystroke.
+    ///
+    /// Note there is deliberately no published `searchInput` here. It used to
+    /// live on this object, and because every view observes `FontLibrary`,
+    /// each keystroke rebuilt the entire UI — which made the debounce below
+    /// pointless. The text field now owns its own `@State`.
     @Published private(set) var searchQuery: String = ""
 
     private var searchDebounceTask: Task<Void, Never>?
+    private var pendingSearch: String = ""
 
-    /// Called from the search TextField's `onChange`. Stores the keystroke
-    /// immediately and schedules a debounced commit to `searchQuery`.
+    /// Called from the search TextField's `onChange`. Schedules a debounced
+    /// commit to `searchQuery`; nothing is published until the debounce fires.
     func updateSearchInput(_ text: String) {
-        searchInput = text
+        pendingSearch = text
         searchDebounceTask?.cancel()
         searchDebounceTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 180_000_000)  // 180ms
-            guard !Task.isCancelled, self.searchInput == text else { return }
+            guard !Task.isCancelled, self.pendingSearch == text else { return }
             if self.searchQuery != text {
                 self.searchQuery = text
+                // Drop the (large) lowercased index once searching stops.
+                if text.trimmingCharacters(in: .whitespaces).isEmpty {
+                    self.searchIndexCache = nil
+                }
                 self.invalidateDerivedViews()
             }
         }
@@ -106,7 +149,7 @@ final class FontLibrary: ObservableObject {
         self.previewText = state.userText.isEmpty ? previewText : state.userText
         self.previewSize = state.previewSize > 0 ? state.previewSize : previewSize
 
-        if let cached = Persistence.loadCachedLibrary(), !cached.isEmpty,
+        if let cached = await Persistence.loadCachedLibraryOffMain(), !cached.isEmpty,
            !Self.cacheLooksStale(cached) {
             self.items = cached
             invalidateDerived()
@@ -123,6 +166,7 @@ final class FontLibrary: ObservableObject {
     func rescan() async {
         isScanning = true
         scanStatus = "Scanning fonts…"
+        let previousItems = items
         let roots = visibleDefaultSources + customScanPaths
         let result = await FontScanner.scanParallel(roots: roots)
         var merged = result.items
@@ -150,13 +194,70 @@ final class FontLibrary: ObservableObject {
             return $0.familyName.lowercased() < $1.familyName.lowercased()
         }
         invalidateDerived()
+        migrateReferences(from: previousItems)
         self.orphanURLs = result.orphanURLs
         let systemExtra = max(0, merged.count - result.items.count)
         scanStatus = "\(items.count) faces across \(Set(items.map{$0.familyKey}).count) families"
             + (systemExtra > 0 ? " · +\(systemExtra) from other managers" : "")
             + (result.orphanURLs.isEmpty ? "" : " · \(result.orphanURLs.count) orphan\(result.orphanURLs.count == 1 ? "" : "s")")
         isScanning = false
-        Persistence.saveCachedLibrary(items)
+        saveCacheNow()
+    }
+
+    /// Re-points favorites / collections / variable instances at the new
+    /// `FontItem.id`s after a rescan.
+    ///
+    /// `FontItem.id` hashes the absolute path, so moving a file changes its ID.
+    /// `moveFontFile` patches the in-memory record to keep the old ID, but the
+    /// *next* rescan regenerated it from the new path — silently dropping the
+    /// font out of every Favorite, Project and Palette it belonged to. We
+    /// rebuild the mapping using an identity that survives a move: PostScript
+    /// name + filename + byte size.
+    private func migrateReferences(from previous: [FontItem]) {
+        guard !previous.isEmpty else { return }
+
+        func identity(_ i: FontItem) -> String {
+            "\(i.postScriptName)::\(i.fileURL.lastPathComponent)::\(i.fileSize)"
+        }
+
+        // Which IDs do we actually care about? Only referenced ones.
+        var referenced = favorites
+        for c in collections { referenced.formUnion(c.fontIDs) }
+        referenced.formUnion(variableInstances.map { $0.baseFontID })
+        guard !referenced.isEmpty else { return }
+
+        let currentIDs = Set(items.map { $0.id })
+        let dangling = referenced.subtracting(currentIDs)
+        guard !dangling.isEmpty else { return }
+
+        // identity → new id. Ambiguous identities (true duplicate files) are
+        // skipped: guessing there could silently retarget the wrong copy.
+        var newByIdentity: [String: String] = [:]
+        var ambiguous: Set<String> = []
+        for i in items {
+            let k = identity(i)
+            if newByIdentity[k] != nil { ambiguous.insert(k) } else { newByIdentity[k] = i.id }
+        }
+
+        var remap: [String: String] = [:]
+        for old in previous where dangling.contains(old.id) {
+            let k = identity(old)
+            guard !ambiguous.contains(k), let newID = newByIdentity[k] else { continue }
+            remap[old.id] = newID
+        }
+        guard !remap.isEmpty else { return }
+
+        favorites = Set(favorites.map { remap[$0] ?? $0 })
+        for idx in collections.indices {
+            collections[idx].fontIDs = Set(collections[idx].fontIDs.map { remap[$0] ?? $0 })
+        }
+        for idx in variableInstances.indices {
+            if let newID = remap[variableInstances[idx].baseFontID] {
+                variableInstances[idx].baseFontID = newID
+            }
+        }
+        invalidateMembership()
+        persist()
     }
 
     // MARK: - Derived data
@@ -208,6 +309,21 @@ final class FontLibrary: ObservableObject {
         return result
     }
 
+    /// Lowercased "family⇥style⇥postscript" per item, positionally parallel to
+    /// `items`. Built lazily on the first non-empty search and dropped when the
+    /// search clears, so an idle library pays nothing for it. Without this,
+    /// every search lowercased three strings per item — 78 000 × 3 allocations.
+    private var searchIndexCache: (Int, [String])? = nil
+
+    private var searchIndex: [String] {
+        if let c = searchIndexCache, c.0 == derivedVersion { return c.1 }
+        let idx = items.map {
+            "\($0.familyName)\t\($0.styleName)\t\($0.postScriptName)".lowercased()
+        }
+        searchIndexCache = (derivedVersion, idx)
+        return idx
+    }
+
     func currentItems() -> [FontItem] {
         if let c = currentItemsCache,
            c.derivedVersion == derivedVersion,
@@ -218,46 +334,51 @@ final class FontLibrary: ObservableObject {
             return c.result
         }
         let q = searchQuery.trimmingCharacters(in: .whitespaces).lowercased()
-        let scope: [FontItem]
+
+        // Scope test as a predicate so scoping and searching run in ONE pass
+        // instead of materializing an intermediate array.
+        let inScope: (FontItem) -> Bool
         switch sidebarSelection {
-        case .allFonts:
-            scope = items
+        case .allFonts, .tool, .cloud:
+            // Tool and Cloud views render their own data; family list is
+            // unused there, so "everything" is the sensible fallback.
+            inScope = { _ in true }
         case .active:
-            scope = items.filter { activeFontIDs.contains($0.id) }
+            inScope = { [activeFontIDs] in activeFontIDs.contains($0.id) }
         case .inactive:
-            scope = items.filter { !activeFontIDs.contains($0.id) }
+            inScope = { [activeFontIDs] in !activeFontIDs.contains($0.id) }
         case .favorites:
-            scope = items.filter { favorites.contains($0.id) }
+            inScope = { [favorites] in favorites.contains($0.id) }
         case .variable:
-            scope = items.filter { $0.isVariable }
+            inScope = { $0.isVariable }
         case .category(let cat):
-            scope = items.filter { $0.categories.contains(cat) }
+            inScope = { $0.categories.contains(cat) }
         case .mood(let mood):
-            scope = items.filter { $0.moods.contains(mood) }
+            inScope = { $0.moods.contains(mood) }
         case .foundry(let name):
-            scope = items.filter { $0.foundry == name }
+            inScope = { $0.foundry == name }
         case .source(let url):
+            // Item URLs are standardized at scan time — raw `.path` is correct
+            // here and ~8× cheaper than re-standardizing per element.
             let prefix = url.standardizedFileURL.path
-            scope = items.filter { $0.fileURL.standardizedFileURL.path.hasPrefix(prefix) }
+            inScope = { $0.fileURL.path.hasPrefix(prefix) }
         case .collection(let id):
             if let c = collections.first(where: { $0.id == id }) {
-                scope = items.filter { c.fontIDs.contains($0.id) }
-            } else { scope = [] }
-        case .tool, .cloud:
-            // Tool and Cloud views render their own data; family list is
-            // unused here, but return all so the fallback is sensible.
-            scope = items
+                inScope = { c.fontIDs.contains($0.id) }
+            } else { inScope = { _ in false } }
         }
-        let filtered: [FontItem]
+
+        var filtered: [FontItem] = []
         if q.isEmpty {
-            filtered = scope
+            for item in items where inScope(item) { filtered.append(item) }
         } else {
-            filtered = scope.filter {
-                $0.familyName.lowercased().contains(q) ||
-                $0.styleName.lowercased().contains(q) ||
-                $0.postScriptName.lowercased().contains(q)
+            let hay = searchIndex
+            for (i, item) in items.enumerated() {
+                guard hay[i].contains(q), inScope(item) else { continue }
+                filtered.append(item)
             }
         }
+
         currentItemsCache = (derivedVersion, sidebarSelection, searchQuery,
                              activeVersion, favoritesVersion, filtered)
         return filtered
@@ -311,14 +432,79 @@ final class FontLibrary: ObservableObject {
         return n
     }
 
+    /// Bucket every item under each known scan root in one pass.
+    ///
+    /// Stores *indices* rather than `FontItem` copies: at 78 000 faces a
+    /// struct-copy bucket map duplicates ~17 MB per index, and there are two
+    /// of them. Indices cost 8 bytes each and materialize on demand.
+    ///
+    /// Item URLs are standardized once at scan time (`FontScanner.buildItem`),
+    /// so matching here uses the raw `.path` — 8× cheaper than re-standardizing
+    /// per element, which is what made the old implementation cost 419 ms.
+    private var sourceBuckets: [String: [Int]] {
+        if let c = sourceBucketsCache, c.0 == derivedVersion { return c.1 }
+        let roots = (visibleDefaultSources + customScanPaths)
+            .map { $0.standardizedFileURL.path }
+        var buckets: [String: [Int]] = [:]
+        for r in roots { buckets[r] = [] }
+        if !roots.isEmpty {
+            for (i, item) in items.enumerated() {
+                let p = item.fileURL.path
+                for r in roots where p.hasPrefix(r) {
+                    buckets[r]!.append(i)
+                }
+            }
+        }
+        sourceBucketsCache = (derivedVersion, buckets)
+        return buckets
+    }
+
+    /// Face count under a scan root. This is all the sidebar needs, and it
+    /// avoids materializing an array of tens of thousands of items per render.
+    func itemCountInSource(_ url: URL) -> Int {
+        let prefix = url.standardizedFileURL.path
+        if let hit = sourceBuckets[prefix] { return hit.count }
+        return items.reduce(0) { $0 + ($1.fileURL.path.hasPrefix(prefix) ? 1 : 0) }
+    }
+
+    /// Full item list for a scan root. Only for callers that genuinely need the
+    /// items (context-menu bulk activate, Organize) — not for per-render use.
     func itemsInSource(_ url: URL) -> [FontItem] {
         let prefix = url.standardizedFileURL.path
-        return items.filter { $0.fileURL.standardizedFileURL.path.hasPrefix(prefix) }
+        if let idx = sourceBuckets[prefix] { return idx.map { items[$0] } }
+        // Not a registered root (e.g. an arbitrary folder passed by Organize) —
+        // fall back to a direct scan.
+        return items.filter { $0.fileURL.path.hasPrefix(prefix) }
+    }
+
+    private var foundryBuckets: [String: [Int]] {
+        if let c = foundryBucketsCache, c.0 == derivedVersion { return c.1 }
+        var buckets: [String: [Int]] = [:]
+        for (i, item) in items.enumerated() {
+            buckets[item.foundry, default: []].append(i)
+        }
+        foundryBucketsCache = (derivedVersion, buckets)
+        return buckets
     }
 
     /// Quick activate-all / deactivate-all helpers for a foundry.
+    /// Materializes from indices — a single foundry averages ~140 faces.
     func itemsInFoundry(_ name: String) -> [FontItem] {
-        items.filter { $0.foundry == name }
+        (foundryBuckets[name] ?? []).map { items[$0] }
+    }
+
+    /// True when every face from this foundry is active, plus whether any is.
+    /// Computed straight off the indices so the sidebar's 546 rows never
+    /// materialize their item arrays.
+    func foundryActivation(_ name: String) -> (all: Bool, any: Bool) {
+        let idx = foundryBuckets[name] ?? []
+        guard !idx.isEmpty else { return (false, false) }
+        var all = true, any = false
+        for i in idx {
+            if activeFontIDs.contains(items[i].id) { any = true } else { all = false }
+            if any && !all { break }
+        }
+        return (all, any)
     }
 
     // MARK: - Favorites
@@ -327,7 +513,7 @@ final class FontLibrary: ObservableObject {
         if favorites.contains(item.id) { favorites.remove(item.id) }
         else { favorites.insert(item.id) }
         favoritesVersion &+= 1
-        invalidateDerived()
+        invalidateMembership()
         persist()
     }
 
@@ -393,7 +579,7 @@ final class FontLibrary: ObservableObject {
         let c = FontCollection(name: name, kind: kind, colorHex: colorHex)
         collections.append(c)
         sidebarSelection = .collection(c.id)
-        invalidateDerived()
+        invalidateMembership()
         persist()
     }
 
@@ -402,7 +588,7 @@ final class FontLibrary: ObservableObject {
         if case .collection(let s) = sidebarSelection, s == id {
             sidebarSelection = .allFonts
         }
-        invalidateDerived()
+        invalidateMembership()
         persist()
     }
 
@@ -415,14 +601,14 @@ final class FontLibrary: ObservableObject {
     func addToCollection(_ id: UUID, fontIDs: [String]) {
         guard let idx = collections.firstIndex(where: { $0.id == id }) else { return }
         collections[idx].fontIDs.formUnion(fontIDs)
-        invalidateDerived()
+        invalidateMembership()
         persist()
     }
 
     func removeFromCollection(_ id: UUID, fontIDs: [String]) {
         guard let idx = collections.firstIndex(where: { $0.id == id }) else { return }
         collections[idx].fontIDs.subtract(fontIDs)
-        invalidateDerived()
+        invalidateMembership()
         persist()
     }
 
@@ -444,7 +630,10 @@ final class FontLibrary: ObservableObject {
     }
 
     var missingReferences: [MissingReference] {
-        if let c = missingRefsCache, c.0 == derivedVersion { return c.1 }
+        if let c = missingRefsCache,
+           c.derived == derivedVersion, c.membership == membershipVersion {
+            return c.refs
+        }
         let existing = Set(items.map { $0.id })
         var map: [String: [String]] = [:]
         for id in favorites where !existing.contains(id) {
@@ -462,7 +651,7 @@ final class FontLibrary: ObservableObject {
         let refs = map
             .map { MissingReference(id: $0.key, locations: $0.value) }
             .sorted { $0.id < $1.id }
-        missingRefsCache = (derivedVersion, refs)
+        missingRefsCache = (derivedVersion, membershipVersion, refs)
         return refs
     }
 
@@ -475,7 +664,7 @@ final class FontLibrary: ObservableObject {
             collections[i].fontIDs = collections[i].fontIDs.filter { existing.contains($0) }
         }
         variableInstances.removeAll { !existing.contains($0.baseFontID) }
-        invalidateDerived()
+        invalidateMembership()
         persist()
     }
 
@@ -523,9 +712,8 @@ final class FontLibrary: ObservableObject {
         variableInstances.removeAll { $0.baseFontID == item.id }
         items.removeAll { $0.id == item.id }
         invalidateDerived()
-        if selectedFontID == item.id { selectedFontID = nil }
         persist()
-        Persistence.saveCachedLibrary(items)
+        scheduleCacheSave()
     }
 
     // MARK: - Variable font instances
@@ -540,13 +728,13 @@ final class FontLibrary: ObservableObject {
         guard !trimmed.isEmpty else { return }
         let inst = VariableInstance(baseFontID: base.id, name: trimmed, axisValues: axisValues)
         variableInstances.append(inst)
-        invalidateDerived()
+        invalidateMembership()
         persist()
     }
 
     func deleteVariableInstance(_ id: UUID) {
         variableInstances.removeAll { $0.id == id }
-        invalidateDerived()
+        invalidateMembership()
         persist()
     }
 
@@ -664,6 +852,29 @@ final class FontLibrary: ObservableObject {
 
     // MARK: - Persistence helper
 
+    private var cacheSaveTask: Task<Void, Never>?
+
+    /// Encoding the library costs ~1 s. It used to run synchronously on the
+    /// main actor inside `deleteFontFile` / `moveFontFile`, so every single
+    /// delete froze the UI for a second. Now it is debounced and detached, so
+    /// a burst of deletes writes once, off the main thread.
+    private func scheduleCacheSave() {
+        cacheSaveTask?.cancel()
+        let snapshot = items
+        cacheSaveTask = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
+            Persistence.saveCachedLibrary(snapshot)
+        }
+    }
+
+    /// Flush any pending library write immediately (used on rescan completion).
+    private func saveCacheNow() {
+        cacheSaveTask?.cancel()
+        let snapshot = items
+        Task.detached(priority: .utility) { Persistence.saveCachedLibrary(snapshot) }
+    }
+
     private func persist() {
         let state = LibraryState(
             favorites: favorites,
@@ -699,8 +910,21 @@ final class FontLibrary: ObservableObject {
     /// Same as `visibleDefaultSources` but also drops any folder with fewer
     /// than two fonts — silences the sidebar when `/Library/Fonts` is empty
     /// (modern macOS keeps almost nothing there by default).
+    ///
+    /// Cached: `SidebarView` reads this on every body evaluation, and each read
+    /// used to trigger one full-library scan per root.
     var displayableDefaultSources: [URL] {
-        visibleDefaultSources.filter { itemsInSource($0).count >= 2 }
+        if let c = displayableSourcesCache, c.0 == derivedVersion { return c.1 }
+        let out = visibleDefaultSources.filter { itemCountInSource($0) >= 2 }
+        displayableSourcesCache = (derivedVersion, out)
+        return out
+    }
+
+    /// Roots that exist but are being hidden from the sidebar, either
+    /// explicitly or because they hold fewer than two fonts. Computed from the
+    /// shared buckets so the sidebar doesn't rescan to answer this.
+    var autoHiddenDefaultSources: [URL] {
+        visibleDefaultSources.filter { itemCountInSource($0) < 2 }
     }
 
     /// The full list of all default scan roots (regardless of hidden state).
@@ -781,17 +1005,33 @@ final class FontLibrary: ObservableObject {
                 familyName: old.familyName, styleName: old.styleName,
                 displayName: old.displayName, weight: old.weight, width: old.width,
                 slant: old.slant, isItalic: old.isItalic, isMonospaced: old.isMonospaced,
-                isBold: old.isBold, format: old.format, categories: old.categories,
+                isBold: old.isBold, format: old.formatKind, categories: old.categories,
                 moods: old.moods, glyphCount: old.glyphCount, fileSize: old.fileSize,
                 dateAdded: old.dateAdded, panose: old.panose,
                 variationAxes: old.variationAxes, foundry: old.foundry
             )
             invalidateDerived()
         }
-        Persistence.saveCachedLibrary(items)
+        scheduleCacheSave()
     }
 
-    func savePreviewPrefs() { persist() }
+    // MARK: - Benchmark support (see Benchmark.swift / `--bench`)
+
+    /// Installs a pre-decoded item array without touching disk or Core Text,
+    /// so the harness can measure derived-data cost in isolation.
+    func installForBenchmark(_ newItems: [FontItem]) {
+        self.items = newItems
+        invalidateDerived()
+    }
+
+    /// Drops every derived cache so the next getter measures a cold build.
+    func invalidateForBenchmark() { invalidateDerived() }
+
+    /// Bypasses the debounce so the harness measures the filter itself.
+    func commitSearchForBenchmark(_ text: String) {
+        searchQuery = text
+        invalidateDerivedViews()
+    }
 }
 
 struct FontFamilyGroup: Identifiable {

@@ -362,6 +362,7 @@ private struct DuplicateGroupRow: View {
 /// One file row within a duplicate group — checkbox, path, metadata, actions.
 private struct DuplicateFileRow: View {
     @EnvironmentObject var lib: FontLibrary
+    @EnvironmentObject var sel: SelectionModel
     let item: FontItem
     let isWinner: Bool
     @Binding var selection: Set<String>
@@ -443,7 +444,7 @@ private struct DuplicateFileRow: View {
                 : (selection.contains(item.id) ? Color.red.opacity(0.08) : Color.clear)
         )
         .contentShape(Rectangle())
-        .onTapGesture { lib.selectedFontID = item.id }
+        .onTapGesture { sel.selectedFontID = item.id }
     }
 
     @ViewBuilder

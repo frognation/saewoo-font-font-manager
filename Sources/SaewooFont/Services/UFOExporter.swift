@@ -699,7 +699,7 @@ enum UFOExporter {
                 displayName: "\(item.familyName) \(styleName)",
                 weight: item.weight, width: item.width, slant: item.slant,
                 isItalic: item.isItalic, isMonospaced: item.isMonospaced,
-                isBold: item.isBold, format: item.format,
+                isBold: item.isBold, format: item.formatKind,
                 categories: item.categories, moods: item.moods,
                 glyphCount: item.glyphCount, fileSize: item.fileSize,
                 dateAdded: item.dateAdded, panose: item.panose,
