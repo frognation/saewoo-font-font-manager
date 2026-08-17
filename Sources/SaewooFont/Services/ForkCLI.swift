@@ -36,6 +36,20 @@ enum ForkCLI {
         print("glyphs : \(item.glyphCount)")
         print("fvar named instances read by app: \(UFOExporter.readNamedInstances(item: item).count)\n")
 
+        let fid = UFOFidelity.inspect(item: item)
+        print("--- what will survive the export ---")
+        print("  glyphs        : \(fid.glyphsExported) of \(fid.glyphsInFont)")
+        print("  composites    : \(fid.compositeGlyphs)  \(fid.compositesPreserved ? "(preserved as <component> references)" : "(flattened — lose base/accent link)")")
+        switch fid.kerningSource {
+        case .none:      print("  kerning       : none in font")
+        case .kernTable: print("  kerning       : \(fid.kerningPairs) pairs from legacy kern table")
+        case .gposOnly:  print("  kerning       : GPOS only — NOT extractable")
+        }
+        print("  GSUB features : \(fid.gsubFeatures.isEmpty ? "none" : fid.gsubFeatures.joined(separator: " "))")
+        print("  GPOS features : \(fid.gposFeatures.isEmpty ? "none" : fid.gposFeatures.joined(separator: " "))")
+        print("  -> features are NOT regenerated into features.fea")
+        print("")
+
         try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
         let options = UFOExporter.Options(glyphMode: .full, resetIdentity: false)
 

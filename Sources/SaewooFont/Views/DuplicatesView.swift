@@ -97,7 +97,7 @@ struct DuplicatesView: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Image(systemName: "doc.on.doc")
-                    Text("Identical Files").font(.title3).bold()
+                    Text("Duplicate Files").font(.title3).bold()
                 }
                 Text("""
                 Finds files whose contents are byte-for-byte identical, so removing \

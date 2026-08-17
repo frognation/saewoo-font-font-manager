@@ -10,20 +10,33 @@ future sessions can start from `main` unless the user asks for a feature branch.
 
 ---
 
-## Session 4 — 2026-08-16 · performance pass #3 (uncommitted)
+## Session 4 — 2026-08-16 · commits `25d3efc..ab675a7`
 
-Triggered by "무겁고 느린 게 젤 큰 문제". Everything below is **working-tree
-only — not committed yet**. `swift build -c release` is clean; the app launches,
-idles at 0 % CPU, and the benchmark harness is committed alongside so the next
-session can re-verify before touching anything.
+Triggered by "무겁고 느린 게 젤 큰 문제". Started as a performance pass, then
+widened into persistence safety, a RightFont library migration, a
+Projects/Palettes merge, basic list interaction (multi-select, live source
+status), a rewrite of the Duplicates tool's deletion safety model, and a
+validation pass on the Fork tool's UFO output. All seven commits below landed
+on `main`; nothing from this session is uncommitted.
 
-### Reference machine
+| Commit | Summary |
+|--------|---------|
+| `25d3efc` | perf(library): fix 6.8s sidebar render; split published state; cache I/O off main |
+| `0651669` | fix(persistence): stop `--bench` from wiping state.json; add rolling backups |
+| `7dc4330` | fix(rightfont): correct UUID matching, add headless import, drop attribution fields |
+| `c6ea80a` | refactor(collections): merge Palettes into Projects |
+| `997eb4c` | feat: multi-select fonts (cmd/shift) and live source availability |
+| `afdee88` | feat(duplicates): replace name-based deletion with byte-identical matching |
+| `ab675a7` | test(fork): add `--fork` CLI that exports and validates the UFO it produces |
 
-`~/Library/Fonts` holds 6 904 files, which expand to **77 837 faces / 4 136
-families / 546 foundries**. The old `library-cache.json` was 60 MB. Every number
-below is a **release** build on that library — debug numbers are meaningless here.
+### 1. Performance pass #3 (`25d3efc`)
 
-### New: `--bench` harness (`Services/Benchmark.swift`)
+**Reference machine**: `~/Library/Fonts` holds 6 904 files, which expand to
+**77 837 faces / 4 136 families / 546 foundries**. The old `library-cache.json`
+was 60 MB. Every number below is a **release** build on that library — debug
+numbers are meaningless here.
+
+**New: `--bench` harness** (`Services/Benchmark.swift`):
 
 ```bash
 swift build -c release && ./.build/arm64-apple-macosx/release/SaewooFont --bench
@@ -37,20 +50,17 @@ what the views actually call** — the `sourcesSection` measurement is a hand-wr
 mirror of `SidebarView.sourcesSection`, so if that view changes, change this too
 or the number silently starts lying.
 
-### The actual bug
+**The actual bug**: `SidebarView.sourcesSection` called `itemsInSource()` about
+**nine times per body evaluation**, and `itemsInSource` filtered all 77 837
+items while calling `standardizedFileURL` on each one (419 ms per pass, vs
+54 ms for raw `.path`). That alone was **6 775 ms per sidebar render**. And
+because `searchInput` was `@Published` on `FontLibrary` — which all 14 views
+observe via `@EnvironmentObject` — *every keystroke* re-evaluated that body.
+Typing one character cost ~7 s. The 180 ms search debounce added in Session 2
+was therefore dead code: it debounced `searchQuery`, but publishing
+`searchInput` had already invalidated the whole UI.
 
-`SidebarView.sourcesSection` called `itemsInSource()` about **nine times per body
-evaluation**, and `itemsInSource` filtered all 77 837 items while calling
-`standardizedFileURL` on each one (419 ms per pass, vs 54 ms for raw `.path`).
-
-That alone was **6 775 ms per sidebar render**. And because `searchInput` was
-`@Published` on `FontLibrary` — which all 14 views observe via
-`@EnvironmentObject` — *every keystroke* re-evaluated that body. Typing one
-character cost ~7 s. The 180 ms search debounce added in Session 2 was
-therefore dead code: it debounced `searchQuery`, but publishing `searchInput`
-had already invalidated the whole UI.
-
-### Results
+**Results**:
 
 | path | before | after |
 |------|--------|-------|
@@ -62,9 +72,9 @@ had already invalidated the whole UI.
 | cache decode (launch) | 1 313.7 ms | 1 227.4 ms, now **off the main actor** |
 | cache encode (delete/move) | 1 016.6 ms | 977.9 ms, now **debounced + detached** |
 | settled `phys_footprint` | 437 MB | **364 MB** |
-| peak `phys_footprint` | 549 MB | **712 MB** ⚠️ regression, see below |
+| peak `phys_footprint` | 549 MB | **712 MB** ⚠️ regression, see Known issues |
 
-### What changed
+**What changed**:
 
 1. **Source/foundry buckets** (`FontLibrary`). `itemsInSource` / `itemsInFoundry`
    are now dictionary lookups built in one pass and cached by `derivedVersion`.
@@ -106,53 +116,232 @@ had already invalidated the whole UI.
    now remaps references using an identity that survives a move
    (PostScript name + filename + byte size), skipping ambiguous matches.
 
-### ⛔️ Data-loss incident caused by this session — read before writing tools
+### 2. Persistence hardening — `--bench` wiped `state.json` (`0651669`)
 
-The `--bench` harness built a `FontLibrary` directly and never called
-`bootstrap()`, so its `favorites` / `collections` / `customScanPaths` were all
-empty. It then called `toggleFavorite` to measure the invalidation cascade —
-which reaches `persist()` — and wrote that **empty state over the user's real
-`state.json`**, once per benchmark run.
+⛔️ **Data-loss incident caused by this session — read before writing tools.**
+The `--bench` harness (added in commit 1, above) built a `FontLibrary` directly
+and never called `bootstrap()`, so its `favorites` / `collections` /
+`customScanPaths` were all empty. It then called `toggleFavorite` to measure
+the invalidation cascade — which reaches `persist()` — and wrote that **empty
+state over the user's real `state.json`**, once per benchmark run.
 
 Lost: every `customScanPath` (~69 700 of the user's 77 837 faces came from
 Dropbox / Google Drive / RightFont folders registered there), all favorites,
-and any collection that existed at the time. The `library-cache.json` was
+and any collection that existed at the time. `library-cache.json` was
 untouched, so the *font list* still looked fine — which is exactly why it went
-unnoticed for hours.
-
-Recovered by reconstructing the scan roots from the file paths inside
-`library-cache.json`. Favorites were not recoverable.
+unnoticed for hours. Recovered by reconstructing the scan roots from the file
+paths inside `library-cache.json`. Favorites were not recoverable.
 
 Two guards now exist, both in `Services/Persistence.swift`:
 
 - **`Persistence.readOnly`** — a hard write-lock. `Benchmark.run()` sets it on
-  its very first line. Any future tool that constructs a `FontLibrary` without
-  `bootstrap()` must do the same.
+  its very first line, and `DuplicateAuditCLI.run()` (added later this session,
+  see `--scan-duplicates` below) does the same. Any future tool that constructs
+  a `FontLibrary` without `bootstrap()` must do the same.
 - **Rolling backups** — `saveState` copies the previous `state.json` to
   `StateBackups/state-<epoch>.json` before overwriting, keeping the last 30.
   `Persistence.stateBackups()` returns them newest-first for a future restore UI.
 
-**Invariant: `state.json` is the only irreplaceable file in this app.**
-`library-cache.json` can always be rebuilt by rescanning; `state.json` cannot —
-it holds scan roots, favorites, projects, palettes and variable instances. Treat
-any code path that can write it as dangerous.
+Verified: `state.json` md5 is unchanged across a full `--bench` run.
 
-### Known issues from this session
+### 3. RightFont import — UUID fix, merge fix, headless import (`7dc4330`)
 
-- ⚠️ **Peak footprint regressed 549 → 712 MB.** Settled memory improved, but
-  launch peak is worse: the cache decode now runs on a background thread
-  *concurrently* with SwiftUI building the UI, instead of blocking the main
-  thread until it finished. An `autoreleasepool` around the decode was tried
-  and did not help. The real fix is to stop shipping a 60 MB JSON blob —
-  a binary/streaming format (or SQLite) would cut decode time, peak memory and
-  file size together. **This is the single highest-value next perf task.**
-- ⚠️ **`WARNING: Application performed a reentrant operation in its NSTableView
-  delegate`** appears once at launch, new with the `List` change in
-  `FontListView`. Harmless today; the message says it will become an assert in
-  a future macOS. Worth tracking down before it does.
+Found while migrating a real 313-fontlist library out of a `.rightfontlibrary`
+package.
+
+1. **UUID normalisation was wrong and silently ate most of the import.**
+   `parseAllFontEntries` keys its map with `normalizeUUID` (hyphens stripped,
+   uppercased), but both lookup sites used only `.uppercased()`. Fontlists
+   store hyphenated UUIDs, so only the minority of lists whose UUIDs happened
+   to already be hyphen-less ever matched. On the reference library this
+   imported 90 of 225 non-empty fontlists; with the fix, 155.
+2. **Same-named fontlists overwrote each other.** RightFont fontlists are a
+   folder tree, so the same leaf name can appear under several parents.
+   `importPalettes` now merges same-named entries within a run instead of
+   replacing, which was collapsing 155 imported lists into 88 palettes and
+   discarding the membership of whichever lost the race.
+3. `createdBy` / `modifiedBy` are no longer decoded — they held the personal
+   names of whoever built the library at the originating studio and were never
+   stored by this app.
+
+Adds `--import-rightfont <library> <map.json>`: a headless import that
+resolves each font through a `location -> new absolute path` map, because the
+in-app importer resolves locations *inside* the package, which stops working
+once fonts have been lifted out and reorganised — but the collections are only
+readable while the package still exists.
+
+Also removes the unused `allExtrasCount` path and drops the Google Drive scan
+root the user retired.
+
+### 4. Projects/Palettes merge (`c6ea80a`)
+
+Projects and Palettes were the same data type and behaviour — a named,
+togglable set of faces — distinguished only by a `Kind` tag, which bought a
+duplicated sidebar section, two identical "Add to…" menus, and a "which one
+was it?" decision on every collection created. Now there is one concept,
+Projects:
+
+- `FontCollection.Kind.palette` is retained **only** for decoding existing
+  `state.json`. `bootstrap()` folds any stored palette into `.project` and
+  persists once; nothing creates `.palette` any more.
+- Sidebar has a single Projects section; the context menu has a single
+  "Add to Project".
+- The RightFont importer now creates projects, and its report counts projects.
+
+### 5. Multi-select and live source availability (`997eb4c`)
+
+**Multi-select**: the list only ever held one selection, so activating twenty
+fonts meant twenty clicks. `SelectionModel` now owns a `selectedIDs` set with
+the standard macOS idioms — plain click replaces the selection, cmd-click
+toggles one row, shift-click extends from the last anchor, cmd-A selects
+everything visible, Esc clears. Shift-ranges run over a flattened
+`visibleOrder` built from the family groups plus whichever families are
+expanded, so a range means what the user sees rather than what the model
+happens to store; the anchor is deliberately left alone when extending, so
+successive shift-clicks re-range from the same origin instead of creeping down
+the list. A selection bar appears above the list for multi-row selections with
+Activate / Deactivate / Add to Project. Right-clicking inside an existing
+multi-selection acts on the whole selection; right-clicking outside it acts on
+just that row, per platform convention. `selectedFontID` is now
+`private(set)` and always a member of `selectedIDs`.
+
+**Source availability**: scan roots live on external drives and cloud mounts
+that disappear mid-session; nothing checked for that, so a disconnected source
+kept showing its last-known count and Reveal in Finder silently failed.
+`SourceStatusChecker` (new `Services/SourceStatus.swift`) classifies a root as
+available / unavailable / empty using a single
+`fileExists(atPath:isDirectory:)` stat — no directory walk, since these roots
+hold tens of thousands of files. `FontLibrary` caches the result in a
+`sourceStatuses` map, refreshed at bootstrap, after every rescan, and on a
+~10s timer that only republishes when something actually changed. The sidebar
+greys offline rows, badges them "Offline", and disables Reveal in Finder and
+the bulk activate/deactivate items for them. The cached count is still shown
+rather than hidden, and `refreshSourceStatuses` never touches `items` —
+unplugging a drive must not wipe the library.
+
+### 6. Duplicates — byte-identical matching replaces name-based deletion (`afdee88`)
+
+The Duplicates tool grouped files by PostScript name and offered to delete the
+"extras". Measured against the real library, that was unsafe:
+
+- 21,949 groups / 71,701 "extras" were offered for deletion.
+- Opening 400 of those groups and comparing contents showed only 66% were
+  actually the same font; the other 34% were different typefaces reusing a
+  name — different versions, weight sets, language cuts.
+- Worse, it counted faces but deleted files. 25,686 offered "extras" lived
+  inside multi-face files, and one file here holds 252 faces, so a single
+  click could take 251 unrelated faces with it.
+- 133 groups had the keeper and the "extra" inside the *same file*, so
+  deleting the extra would delete what it was meant to preserve.
+
+Now nothing destructive is offered unless the files hash identically.
+`DuplicateScanner` (new `Services/DuplicateScanner.swift`) compares in three
+stages so this stays cheap: size buckets (free, from cached `FontItem`s), then
+a SHA-256 of the first and last 16 KB, then a full hash only for what still
+collides. 81,507 files scan in ~10s.
+
+Deletion is lossless by construction — every face in a removed file still
+exists byte-for-byte in the kept copy — and the API takes a group plus its
+keeper, so "delete every copy" is not expressible. Protected system fonts are
+skipped, cloud-synced paths are flagged, and a manifest of deleted → kept is
+written to `DeletionManifests/`.
+
+Favorites and projects pointing at a removed copy are re-pointed at the
+identical face in the keeper. Matching is by PostScript name, falling back to
+position when the names are unusable: Core Text invents placeholders like
+`font0000000030329341` for fonts with no name table, and the number differs
+per registration, so 806 faces in byte-identical files reported different
+names. Without the fallback those references would have silently dangled.
+
+Also fixes `itemsAtPath`, which filtered the whole library on every call —
+the duplicates screen calls it per row and the audit once per copy per group,
+about 7 billion comparisons at this library size, which presented as a hang.
+It is now a cached path → faces map.
+
+Adds `--scan-duplicates`, a read-only audit that runs the real scan and
+asserts the safety property. Current result:
+
+```
+identical groups 23,644 · removable 44,159 · reclaimable 5.92 GB
+groups with no valid keeper ............ 0
+faces with no twin in the keeper ....... 0
+faces paired by position ............... 806
+multi-face files among deletions ....... 969  (identical copy kept)
+protected files among deletions ........ 1,140 (skipped at delete time)
+VERDICT: SAFE
+```
+
+### 7. Fork tool — `--fork` CLI validates the UFO it produces (`ab675a7`)
+
+"Does Fork work?" is not answerable by reading `UFOExporter` — you have to
+look at the bytes. `--fork` runs the real exporter on a real font, then checks
+the bundle against the parts of UFO 3 that Glyphs / RoboFont / fontmake
+refuse to open without, and for variable fonts checks that the masters
+actually differ rather than being the default outlines written N times.
+
+Findings on a 657-glyph, 6-axis variable font and a 253-glyph static OTF:
+
+**Works**: metainfo/fontinfo/layercontents/contents.plist all present and
+consistent, no case-insensitive `.glif` collisions, correct advance widths and
+unicodes, cubic curves for CFF and qcurve for TrueType, 18 fvar named
+instances read correctly, and all 18 masters carrying genuinely distinct
+outlines (variation coordinates are applied).
+
+**Gaps, all confirmed against the output** — this is now the top open item,
+see `NEXT_SESSION.md`:
+
+- **140 of 657 glyphs dropped.** `writeAllGlyphs` walks the character set and
+  maps unicode → glyph, so anything reachable only through GSUB — alternates,
+  ligatures, small caps — never gets exported.
+- **No `kerning.plist`, `features.fea`, `groups.plist` or `lib.plist`**, so
+  all GPOS/GSUB data is discarded.
+- **No `<component>` in any glif**: composites are flattened, so accents stop
+  tracking their base glyph.
+- Glyph filenames use a leading underscore (`_Ccedilla.glif`) where the spec
+  asks for one after each uppercase character (`C_cedilla.glif`). Harmless
+  while `contents.plist` is authoritative, but not conforming.
+- The designspace has `<source>` elements but no `<instance>` elements.
+
+### CLI entry points
+
+All wired in `SaewooFontApp.init()`, checked and `exit(0)`'d before any window
+is created:
+
+| Flag | Does | Source |
+|------|------|--------|
+| `--bench` | Headless perf harness; prints the latency table in section 1 above. Sets `Persistence.readOnly`. | `Services/Benchmark.swift` |
+| `--scan-duplicates` | Read-only audit of the identical-file duplicate scan (section 6). Sets `Persistence.readOnly`. | `Services/RightFontImportCLI.swift` (`DuplicateAuditCLI`) |
+| `--import-rightfont <library> <map.json>` | Headless RightFont library import (section 3). | `Services/RightFontImportCLI.swift` |
+| `--fork <font> <outdir> [--variable]` | Exports and validates a UFO/Designspace bundle (section 7). | `Services/ForkCLI.swift` |
+
+`--scan-duplicates` and `--import-rightfont` are `@MainActor` work; the app
+pumps the run loop (`while !done.value { RunLoop.main.run(until:) }`) rather
+than blocking on a semaphore, because parking the main thread on Swift
+concurrency work that itself needs the main actor would deadlock. Any new CLI
+entry point that touches `FontLibrary` must use the same pattern, not
+`Task { … }` plus a blocking wait.
+
+### Known issues
+
+- ⚠️ **Peak footprint regressed 549 → 712 MB** (section 1). Settled memory
+  improved, but launch peak is worse: the cache decode now runs on a
+  background thread *concurrently* with SwiftUI building the UI, instead of
+  blocking the main thread until it finished. An `autoreleasepool` around the
+  decode was tried and did not help. The real fix is to stop shipping a 60 MB
+  JSON blob — a binary/streaming format (or SQLite) would cut decode time,
+  peak memory and file size together. **Still the single highest-value next
+  perf task.**
+- ⚠️ **`WARNING: Application performed a reentrant operation in its
+  NSTableView delegate`** appears once at launch, new with the `List` change
+  in `FontListView`. Harmless today; the message says it will become an
+  assert in a future macOS. Worth tracking down before it does.
 - `search commit` (172 ms) is now dominated by `familyGroups` regrouping
-  (`Dictionary(grouping:)` + sort over 4 136 families), not by filtering.
-  It runs once per debounce pause, not per keystroke.
+  (`Dictionary(grouping:)` + sort over 4 136 families), not by filtering. It
+  runs once per debounce pause, not per keystroke.
+- **Fork tool fidelity gaps** (section 7) — 140/657 glyphs dropped, no
+  kerning/features/groups/lib, composites flattened, non-conforming glyph
+  filenames, no designspace `<instance>` elements. In progress, see
+  `NEXT_SESSION.md`.
 
 ### Audited but not changed
 
@@ -163,11 +352,8 @@ A read-only pass over the remaining views found these; none were touched:
   i.e. synchronous font parsing during body evaluation.
 - `ProofSheetView.swift:146` — `ForEach(lib.items)` builds a menu over the
   entire library.
-- `InspectorView.swift:9`, `ProofSheetView.swift:71` — `lib.items.first(where:)`
+- `InspectorView.swift:11`, `ProofSheetView.swift:71` — `lib.items.first(where:)`
   linear scan in `body`; wants an id→item dictionary.
-- `DuplicatesView.swift:224+` — `group.max { … } ?? group[0]` crashes on an
-  empty group. Unreachable today (`duplicateGroups` only yields count > 1
-  groups) but a latent trap.
 
 ---
 
@@ -363,6 +549,12 @@ Explicit user requests, in priority order:
    (Trash works but not atomic with our state; consider a versioned
    snapshot under `~/Library/Application Support/SaewooFont/DuplicateBackups/{timestamp}/`
    with a `manifest.json` recording original paths for easy restore).
+   Partially addressed by Session 4 (`afdee88`): deletion is now
+   content-identical and lossless by construction (the deleted face still
+   exists byte-for-byte in the kept file), and a deleted→kept manifest is
+   written to `DeletionManifests/`. That is not the same as a restore-the-
+   original-file backup — it only helps if the keeper survives — so this
+   item is still open.
 
 2. **Duplicates tool — list filters** (path / name / size sort).
    The full-list view should let users sort or filter by file path, by
@@ -499,28 +691,38 @@ design. Activation state persists across relaunches within a login session only.
 ```
 Sources/SaewooFont/
 ├── App/SaewooFontApp.swift           @main + AppDelegate (activation policy fix)
+│                                     + CLI dispatch (--bench/--scan-duplicates/
+│                                       --import-rightfont/--fork), all exit(0) before UI
 ├── Models/
 │   ├── FontItem.swift                one-row-per-face + VariationAxis
-│   └── FontCollection.swift          Projects/Palettes + VariableInstance + LibraryState
+│   └── FontCollection.swift          Projects (Kind.palette decode-only legacy) +
+│                                       VariableInstance + LibraryState
 ├── Services/
 │   ├── FontScanner.swift             filesystem walk → items + orphanURLs (parallel)
 │   │                                 + scanAvailableInSystem + Adobe & Google cache roots
 │   ├── FontClassifier.swift          traits + PANOSE + name → [FontCategory] + [FontMood]
 │   ├── FontActivator.swift           CTFontManager .session scope (actor)
-│   ├── Persistence.swift             state.json + library-cache.json
+│   ├── Persistence.swift             state.json + library-cache.json; readOnly write-lock
+│   │                                 + StateBackups/ rolling backups
 │   ├── FontLibrary.swift             @MainActor coordinator; derivedVersion + caches
 │   ├── SystemFontGuard.swift         essentials + SIP-protection rules for Duplicates/Organize
-│   ├── RightFontImporter.swift       .rightfontlibrary parser → palettes + favorites
+│   ├── RightFontImporter.swift       .rightfontlibrary parser → projects + favorites
+│   ├── RightFontImportCLI.swift      --import-rightfont + --scan-duplicates (DuplicateAuditCLI)
+│   ├── DuplicateScanner.swift        3-stage byte-identical matcher (size → edge hash → SHA-256)
 │   ├── UFOExporter.swift             CGPath → GLIF + designspace XML writer (Fork tool)
+│   ├── ForkCLI.swift                 --fork headless export + UFO-fidelity validator
+│   ├── Benchmark.swift               --bench headless perf harness
+│   ├── UIState.swift                 SelectionModel (multi-select) + PreviewSettings
+│   ├── SourceStatus.swift            SourceStatusChecker — available/unavailable/empty
 │   └── GoogleFontsClient.swift       /metadata/fonts catalog + CSS2 download + cache
 └── Views/
     ├── ContentView.swift             NavigationSplitView + tool/cloud routing
     ├── SidebarView.swift             4-tier hierarchy: Sources / Cloud / Library / Tools
-    ├── FontListView.swift            family-grouped list; FontPreviewCache (NSCache, 1000)
+    ├── FontListView.swift            family-grouped List; multi-select bar; FontPreviewCache
     ├── InspectorView.swift           metadata + classification + variable section
     ├── VariablePlaygroundView.swift  axis sliders + instance save
     ├── AddCollectionSheet.swift      AppKit sheet (beginSheet) + NewCollectionPrompt
-    ├── DuplicatesView.swift          PS-name collisions; bulk trash + 5 keep strategies
+    ├── DuplicatesView.swift          byte-identical groups; bulk trash + keep strategies
     ├── OrganizeView.swift            Move / Sort-into-subfolders
     ├── ProofSheetView.swift          Type / Glyphs / Coverage + export + GlyphDetail popover
     ├── OrphansView.swift             unparseable files
@@ -562,6 +764,44 @@ Sources/SaewooFont/
 - **Cache staleness** is detected in `cacheLooksStale` — if all items have
   `foundry == "Unknown"` the cache predates foundry extraction, so we rescan.
   Same pattern for future schema changes.
+- **`Persistence.readOnly`** is a hard write-lock on `saveState` /
+  `saveCachedLibrary`. Any code path that builds a `FontLibrary` without going
+  through `bootstrap()` — a benchmark, an audit, any future headless CLI tool —
+  **must** set it before doing anything else. This exists because `--bench`
+  once wrote an empty state over the user's real `state.json` (Session 4,
+  commit `0651669`); see that section for the full incident.
+- **`state.json` is the only irreplaceable file in this app.**
+  `library-cache.json` can always be rebuilt by rescanning; `state.json`
+  cannot — it holds scan roots, favorites, projects and variable instances.
+  `saveState` backs up the previous file to `StateBackups/state-<epoch>.json`
+  (last 30 kept) before every write; treat any code path that can write it as
+  dangerous regardless.
+- **Duplicate deletion is content-identical, not name-based.** Measured
+  against the real library, grouping by PostScript name and offering the
+  "extras" for deletion was unsafe — only 66% of same-named groups were
+  actually the same font (Session 4, commit `afdee88`). `DuplicateScanner`
+  groups only by matching hash (size bucket → 16 KB edge hash → full SHA-256).
+  **Don't reintroduce a name-based or metadata-based match as grounds for
+  deletion** — only byte-identical files may be offered as removable, and the
+  API must take a group plus its keeper so "delete every copy" stays
+  inexpressible.
+- **Projects and Palettes are one concept now** (`c6ea80a`).
+  `FontCollection.Kind.palette` exists **only** to decode old `state.json`
+  entries; `bootstrap()` folds any stored palette into `.project` on load.
+  Nothing should construct `.palette` going forward.
+- **RightFont UUID matching must use `normalizeUUID`** (hyphens stripped,
+  uppercased) at every lookup site, not `.uppercased()` alone. Fontlists store
+  hyphenated UUIDs; using the wrong normalisation silently drops most of an
+  import (was 90/225 fontlists, should be 155/225 on the reference library —
+  commit `7dc4330`).
+- **CLI entry points must not block the main thread on `Task { … }`.**
+  `--scan-duplicates` and `--import-rightfont` do `@MainActor` work reached
+  from `SaewooFontApp.init()`, before the run loop is pumping normally.
+  Blocking on a semaphore there deadlocks, because the work itself needs the
+  main actor to proceed. The existing pattern —
+  `while !done.value { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }`
+  — keeps the run loop alive long enough for the cooperative thread pool to
+  make progress. Follow it for any new headless entry point.
 
 ---
 
@@ -597,8 +837,8 @@ five cloud follow-ups). Beyond those:
    map in `LibraryState` keyed by FontItem.id, persisted via Persistence.
    Could become a sixth Tools entry alongside Largest Files.
 
-5. **iCloud / Dropbox sync of state.json** — share Projects + Palettes
-   across machines. Trivial if sync folder is already mounted; harder for
+5. **iCloud / Dropbox sync of state.json** — share Projects across
+   machines. Trivial if sync folder is already mounted; harder for
    seamless conflict resolution. Also useful for the Google Fonts catalog
    cache so multiple machines don't each re-fetch.
 

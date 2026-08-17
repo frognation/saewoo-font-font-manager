@@ -1435,7 +1435,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .duplicates:  return "Identical Files"
+        case .duplicates:  return "Duplicate Files"
         case .organize:    return "Organize"
         case .proofSheet:  return "Proof Sheet"
         case .orphans:     return "Orphan Files"

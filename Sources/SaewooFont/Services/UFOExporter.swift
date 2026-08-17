@@ -97,6 +97,10 @@ enum UFOExporter {
         try writeMetainfo(to: ufo)
         try writeFontInfo(to: ufo, item: item, font: font, upm: upm, options: options)
 
+        // Composite structure, TrueType only. Empty for CFF and for anything
+        // using point-matching placement.
+        let comps = GlyfComponents.read(font: font)
+
         let glyphCount: Int
         switch options.glyphMode {
         case .empty:
@@ -106,12 +110,14 @@ enum UFOExporter {
             glyphCount = 1
         case .full:
             glyphCount = try writeAllGlyphs(to: ufo, layerName: "public.default",
-                                            dirName: "glyphs", font: font, upm: upm)
+                                            dirName: "glyphs", font: font, upm: upm,
+                                            components: comps)
             try writeLayerContents(to: ufo, layers: [("public.default", "glyphs")])
         case .background:
             try writeEmptyLayer(to: ufo, upm: upm)
             glyphCount = try writeAllGlyphs(to: ufo, layerName: "public.background",
-                                            dirName: "glyphs.background", font: font, upm: upm)
+                                            dirName: "glyphs.background", font: font, upm: upm,
+                                            components: comps)
             try writeLayerContents(to: ufo, layers: [
                 ("public.default",    "glyphs"),
                 ("public.background", "glyphs.background")
@@ -220,8 +226,15 @@ enum UFOExporter {
     /// specified layer. Returns the number of glyphs written. Uses the font's
     /// own PostScript glyph names when available (via CGFont), falling back to
     /// `uni{HEX}` for anything unnamed.
+    /// - Parameter components: glyph index → composite structure, or nil to
+    ///   flatten. Passed nil for variable-font masters on purpose: `gvar`
+    ///   shifts component offsets per instance, and this reader only sees the
+    ///   default `glyf`, so reusing those offsets would misplace every accent
+    ///   in every non-default master. Flattened outlines are at least correct.
     private static func writeAllGlyphs(to ufo: URL, layerName: String, dirName: String,
-                                        font: CTFont, upm: Int) throws -> Int {
+                                        font: CTFont, upm: Int,
+                                        components: [Int: [GlyfComponents.Component]]? = nil
+    ) throws -> Int {
         let fm = FileManager.default
         let dir = ufo.appendingPathComponent(dirName, isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -239,7 +252,14 @@ enum UFOExporter {
         // Glyph index → record, keyed by CGGlyph so we fold duplicate unicodes.
         var byGlyph: [CGGlyph: GlyphRecord] = [:]
 
-        // Iterate supported unicode scalars.
+        // Pass 1 — unicode coverage only. This walk exists to learn which
+        // scalars map to which glyph; it is NOT the list of glyphs to export.
+        //
+        // It used to be both, and that silently dropped every glyph reachable
+        // only through GSUB — stylistic alternates, ligatures, small caps. On
+        // a 657-glyph variable font it exported 517, losing 140 of exactly the
+        // glyphs a designer forking a typeface would care about.
+        var unicodesByGlyph: [CGGlyph: [UInt32]] = [:]
         for plane: UInt32 in 0...16 {
             let start = plane << 16
             let end   = start + 0xFFFF
@@ -258,37 +278,25 @@ enum UFOExporter {
                 let ok = CTFontGetGlyphsForCharacters(font, utf16Pair, &glyphs, utf16Pair.count)
                 guard ok, let glyph = glyphs.first, glyph != 0 else { continue }
 
-                if var rec = byGlyph[glyph] {
-                    rec.unicodes.append(code)
-                    byGlyph[glyph] = rec
-                } else {
-                    byGlyph[glyph] = GlyphRecord(
-                        name: preferredName(for: glyph, cgFont: cgFont, unicode: code),
-                        unicodes: [code],
-                        advance: 0, path: nil
-                    )
-                }
+                unicodesByGlyph[glyph, default: []].append(code)
             }
         }
 
-        // Fetch advance + path for each unique glyph.
-        for (glyph, var rec) in byGlyph {
+        // Pass 2 — every glyph in the font, by index. `.notdef` is glyph 0, so
+        // it comes along for free.
+        let totalGlyphs = CTFontGetGlyphCount(font)
+        for gid in 0..<totalGlyphs {
+            let glyph = CGGlyph(gid)
+            let unicodes = unicodesByGlyph[glyph] ?? []
             var adv = CGSize.zero
             var g = glyph
             _ = CTFontGetAdvancesForGlyphs(font, .horizontal, &g, &adv, 1)
-            rec.advance = Int(adv.width.rounded())
-            rec.path = CTFontCreatePathForGlyph(font, glyph, nil)
-            byGlyph[glyph] = rec
-        }
-
-        // Always include .notdef (glyph 0) for completeness.
-        if byGlyph[0] == nil {
-            var adv = CGSize.zero; var g: CGGlyph = 0
-            _ = CTFontGetAdvancesForGlyphs(font, .horizontal, &g, &adv, 1)
-            byGlyph[0] = GlyphRecord(
-                name: ".notdef", unicodes: [],
+            byGlyph[glyph] = GlyphRecord(
+                name: preferredName(for: glyph, cgFont: cgFont,
+                                    unicode: unicodes.first, gid: gid),
+                unicodes: unicodes,
                 advance: Int(adv.width.rounded()),
-                path: CTFontCreatePathForGlyph(font, 0, nil)
+                path: CTFontCreatePathForGlyph(font, glyph, nil)
             )
         }
 
@@ -307,13 +315,26 @@ enum UFOExporter {
             finalRecords.append((g, r))
         }
 
+        // Components reference other glyphs BY NAME, so the (deduplicated)
+        // names have to exist before any glif is written.
+        var nameByGid: [Int: String] = [:]
+        for (g, r) in finalRecords { nameByGid[Int(g)] = r.name }
+
         // Write each .glif.
         var contentsMap: [(String, String)] = []
-        for (_, rec) in finalRecords {
+        for (glyph, rec) in finalRecords {
             let fileName = glifFileName(for: rec.name) + ".glif"
             let url = dir.appendingPathComponent(fileName)
+            let comps: [GlifComponent] = (components?[Int(glyph)] ?? []).compactMap { c in
+                guard let base = nameByGid[c.glyphIndex] else { return nil }
+                return GlifComponent(base: base, dx: c.dx, dy: c.dy,
+                                     xScale: c.xScale, s01: c.scale01,
+                                     s10: c.scale10, yScale: c.yScale)
+            }
             let glif = buildGlif(name: rec.name, unicodes: rec.unicodes,
-                                 advance: rec.advance, path: rec.path,
+                                 advance: rec.advance,
+                                 path: comps.isEmpty ? rec.path : nil,
+                                 components: comps,
                                  layerHint: layerName)
             try glif.write(to: url, atomically: true, encoding: .utf8)
             contentsMap.append((rec.name, fileName))
@@ -358,8 +379,15 @@ enum UFOExporter {
 
     // MARK: - Glif builder
 
+    struct GlifComponent {
+        let base: String
+        let dx: Double, dy: Double
+        let xScale: Double, s01: Double, s10: Double, yScale: Double
+    }
+
     private static func buildGlif(name: String, unicodes: [UInt32], advance: Int,
-                                   path: CGPath?, layerHint: String) -> String {
+                                   path: CGPath?, components: [GlifComponent] = [],
+                                   layerHint: String) -> String {
         var s = """
         <?xml version="1.0" encoding="UTF-8"?>
         <glyph name="\(xmlEscape(name))" format="2">
@@ -368,13 +396,34 @@ enum UFOExporter {
         for u in unicodes {
             s += "\n  <unicode hex=\"\(String(format: "%04X", u))\"/>"
         }
-        if let p = path, !p.isEmpty {
+        if !components.isEmpty {
+            // A composite: reference the base glyphs instead of baking their
+            // outlines in, so editing "A" still updates "Á À Â Ä".
+            s += "\n  <outline>"
+            for c in components {
+                s += "\n    <component base=\"\(xmlEscape(c.base))\""
+                if c.dx != 0 { s += " xOffset=\"\(trimmed(c.dx))\"" }
+                if c.dy != 0 { s += " yOffset=\"\(trimmed(c.dy))\"" }
+                if c.xScale != 1 { s += " xScale=\"\(trimmed(c.xScale))\"" }
+                if c.yScale != 1 { s += " yScale=\"\(trimmed(c.yScale))\"" }
+                if c.s01 != 0 { s += " xyScale=\"\(trimmed(c.s01))\"" }
+                if c.s10 != 0 { s += " yxScale=\"\(trimmed(c.s10))\"" }
+                s += "/>"
+            }
+            s += "\n  </outline>"
+        } else if let p = path, !p.isEmpty {
             s += "\n  <outline>"
             s += pathToGlifContours(p)
             s += "\n  </outline>"
         }
         s += "\n</glyph>\n"
         return s
+    }
+
+    /// Whole numbers without a trailing ".0" — glif attributes read better and
+    /// diff more cleanly that way.
+    private static func trimmed(_ d: Double) -> String {
+        d == d.rounded() ? String(Int(d)) : String(format: "%.4g", d)
     }
 
     /// Converts a CGPath into UFO GLIF `<contour>` XML. Handles all CGPath
@@ -461,19 +510,18 @@ enum UFOExporter {
 
     // MARK: - Name + path helpers
 
-    private static func preferredName(for glyph: CGGlyph, cgFont: CGFont, unicode: UInt32) -> String {
-        if let cf = cgFont.name(for: glyph) as String? {
-            return cf.isEmpty ? fallbackName(for: glyph, unicode: unicode) : cf
-        }
-        return fallbackName(for: glyph, unicode: unicode)
+    /// The font's own glyph name where it has one. `unicode` is now optional
+    /// because we export unmapped glyphs too, and those have no scalar to name
+    /// themselves after — they fall back to their glyph index.
+    private static func preferredName(for glyph: CGGlyph, cgFont: CGFont,
+                                      unicode: UInt32?, gid: Int) -> String {
+        if let cf = cgFont.name(for: glyph) as String?, !cf.isEmpty { return cf }
+        return fallbackName(unicode: unicode, gid: gid)
     }
 
-    private static func fallbackName(for glyph: CGGlyph, unicode: UInt32) -> String {
-        if unicode <= 0xFFFF {
-            return String(format: "uni%04X", unicode)
-        } else {
-            return String(format: "u%04X", unicode)
-        }
+    private static func fallbackName(unicode: UInt32?, gid: Int) -> String {
+        guard let u = unicode else { return String(format: "glyph%05d", gid) }
+        return u <= 0xFFFF ? String(format: "uni%04X", u) : String(format: "u%04X", u)
     }
 
     /// UFO requires glyph filenames to be case-insensitive unique on HFS+.
