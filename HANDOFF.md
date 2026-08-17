@@ -106,6 +106,37 @@ had already invalidated the whole UI.
    now remaps references using an identity that survives a move
    (PostScript name + filename + byte size), skipping ambiguous matches.
 
+### ⛔️ Data-loss incident caused by this session — read before writing tools
+
+The `--bench` harness built a `FontLibrary` directly and never called
+`bootstrap()`, so its `favorites` / `collections` / `customScanPaths` were all
+empty. It then called `toggleFavorite` to measure the invalidation cascade —
+which reaches `persist()` — and wrote that **empty state over the user's real
+`state.json`**, once per benchmark run.
+
+Lost: every `customScanPath` (~69 700 of the user's 77 837 faces came from
+Dropbox / Google Drive / RightFont folders registered there), all favorites,
+and any collection that existed at the time. The `library-cache.json` was
+untouched, so the *font list* still looked fine — which is exactly why it went
+unnoticed for hours.
+
+Recovered by reconstructing the scan roots from the file paths inside
+`library-cache.json`. Favorites were not recoverable.
+
+Two guards now exist, both in `Services/Persistence.swift`:
+
+- **`Persistence.readOnly`** — a hard write-lock. `Benchmark.run()` sets it on
+  its very first line. Any future tool that constructs a `FontLibrary` without
+  `bootstrap()` must do the same.
+- **Rolling backups** — `saveState` copies the previous `state.json` to
+  `StateBackups/state-<epoch>.json` before overwriting, keeping the last 30.
+  `Persistence.stateBackups()` returns them newest-first for a future restore UI.
+
+**Invariant: `state.json` is the only irreplaceable file in this app.**
+`library-cache.json` can always be rebuilt by rescanning; `state.json` cannot —
+it holds scan roots, favorites, projects, palettes and variable instances. Treat
+any code path that can write it as dangerous.
+
 ### Known issues from this session
 
 - ⚠️ **Peak footprint regressed 549 → 712 MB.** Settled memory improved, but

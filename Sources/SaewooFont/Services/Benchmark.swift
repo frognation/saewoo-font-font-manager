@@ -27,7 +27,14 @@ enum Benchmark {
 
     @MainActor
     static func run() {
-        print("\n=== SaewooFont benchmark ===\n")
+        // FIRST LINE, ALWAYS. The harness builds a FontLibrary without running
+        // bootstrap(), so its favorites / collections / customScanPaths are
+        // empty. Any mutation below reaches persist(), and without this lock it
+        // would write that empty state over the user's real state.json. That
+        // regression actually shipped once — it cost the user every custom scan
+        // folder and favorite they had. Do not move or remove this.
+        Persistence.readOnly = true
+        print("\n=== SaewooFont benchmark === (read-only: no user state is written)\n")
 
         var items: [FontItem] = []
         measure("Persistence.loadCachedLibrary (launch decode)") {
