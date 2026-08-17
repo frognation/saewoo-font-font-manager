@@ -50,6 +50,11 @@ struct DuplicatesView: View {
             } else if groups.isEmpty {
                 idle
             } else {
+                // Scan → full list → set the rule → delete. The policy panel
+                // sits above the list so the rule is chosen once, globally,
+                // instead of per-group across tens of thousands of groups.
+                KeeperPolicyPanel()
+                Divider()
                 actionBar
                 Divider()
                 list
@@ -159,7 +164,7 @@ struct DuplicatesView: View {
     private var actionBar: some View {
         HStack(spacing: 10) {
             Button("Rescan") { Task { await lib.scanContentDuplicates() } }
-            Text("Click any copy to make it the one that's kept.")
+            Text("위 기준이 전체에 적용됩니다. 특정 그룹만 다르게 하려면 그 줄을 클릭하세요.")
                 .font(.caption2).foregroundStyle(.secondary)
             Spacer()
             Button("Select All") { excluded.removeAll() }

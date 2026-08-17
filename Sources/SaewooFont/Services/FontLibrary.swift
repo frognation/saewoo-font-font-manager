@@ -1127,36 +1127,127 @@ final class FontLibrary: ObservableObject {
         isScanningDuplicates = false
     }
 
-    /// Which copy to keep, in descending order of "the user would miss this".
+    @Published var keeperPolicy: KeeperPolicy = .load() {
+        didSet { keeperPolicy.save() }
+    }
+
+    /// Which copy to keep, under the user's policy.
     ///
-    /// Because every copy is byte-identical, this only decides *where* the
-    /// surviving file lives — never what the user ends up with.
+    /// Because every copy is byte-identical this only decides *where* the
+    /// survivor lives — never what the user ends up with. Protection always
+    /// outranks the policy: a SIP or macOS-essential file can't be the one
+    /// that gets deleted, whatever the rules say.
     func recommendedKeeper(in group: DuplicateScanner.Group) -> URL {
-        let scored = group.paths.map { url -> (URL, Int) in
-            var score = 0
+        let p = keeperPolicy
+        func score(_ url: URL) -> Int {
+            var s = 0
             let faces = itemsAtPath(url)
-            // Never delete something the guard considers untouchable.
-            if faces.contains(where: { SystemFontGuard.isProtected($0) }) { score += 1000 }
-            if faces.contains(where: { favorites.contains($0.id) })       { score += 100 }
-            if faces.contains(where: { activeFontIDs.contains($0.id) })   { score += 50 }
-            if faces.contains(where: { id in
-                collections.contains { $0.fontIDs.contains(id.id) }
-            }) { score += 40 }
-            // Prefer a stable local folder over a cloud-synced one.
-            if !Self.isCloudSynced(url) { score += 10 }
-            if SystemFontGuard.isInUserFolder(url) { score += 5 }
-            return (url, score)
+            if faces.contains(where: { SystemFontGuard.isProtected($0) }) { s += 1_000_000 }
+            // A copy on an offline source can't be the survivor if the user
+            // asked us not to strand the library there.
+            if p.requireReachableKeeper, !isReachable(url) { s -= 500_000 }
+
+            for rule in p.order where p.enabled.contains(rule) {
+                let w = p.weight(rule)
+                switch rule {
+                case .preferFolder:
+                    if let f = p.preferredFolder, url.path.hasPrefix(f) { s += w }
+                case .preferCloud:
+                    if Self.isCloudSynced(url) { s += w }
+                case .preferLocal:
+                    if !Self.isCloudSynced(url) { s += w }
+                case .preferUserFonts:
+                    if url.path.hasPrefix(NSHomeDirectory() + "/Library/Fonts") { s += w }
+                case .preferCurated:
+                    if faces.contains(where: { favorites.contains($0.id) })
+                        || faces.contains(where: { activeFontIDs.contains($0.id) })
+                        || faces.contains(where: { f in collections.contains { $0.fontIDs.contains(f.id) } }) {
+                        s += w
+                    }
+                case .preferNewest:
+                    if let newest = faces.map({ $0.dateAdded }).max() {
+                        s += w > 0 ? Int(newest.timeIntervalSince1970) / 100_000 : 0
+                    }
+                case .preferLargest:
+                    s += Int((faces.first?.fileSize ?? 0) / 1_000_000)
+                }
+            }
+            return s
         }
-        return scored.max(by: { $0.1 < $1.1 })?.0 ?? group.paths[0]
+        return group.paths.max(by: { score($0) < score($1) }) ?? group.paths[0]
+    }
+
+    /// Is this copy actually usable right now?
+    ///
+    /// Existence is not enough. Cloud clients can leave a placeholder that has
+    /// a path and a logical size but no bytes on disk, and Core Text cannot
+    /// register those — the font looks present and simply fails to activate.
+    /// A materialized file has blocks allocated; a placeholder has ~none.
+    ///
+    /// (Measured on this library: 300/300 sampled Dropbox fonts are fully
+    /// materialized, so a full-sync cloud folder is as usable as local disk —
+    /// and, being replicated across the cloud plus other machines, is more
+    /// durable than a single drive. "Cloud" alone is not the risk; an
+    /// unmaterialized or unmounted copy is.)
+    func isReachable(_ url: URL) -> Bool {
+        guard let v = try? url.resourceValues(forKeys: [.fileSizeKey, .isUbiquitousItemKey])
+        else { return false }
+        let logical = Int64(v.fileSize ?? 0)
+        guard logical > 0 else { return FileManager.default.fileExists(atPath: url.path) }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let blocks = (attrs[.systemFileNumber] != nil)
+                  ? try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
+                        .totalFileAllocatedSize
+                  : nil
+        else { return FileManager.default.fileExists(atPath: url.path) }
+        // Allow for compression/sparse: anything above half the logical size
+        // is a real file, near-zero is a placeholder.
+        return Int64(blocks ?? 0) * 2 >= logical
+    }
+
+    /// Short label for grouping deletions/keepers in the preview.
+    static func locationLabel(_ url: URL) -> String {
+        let p = url.path, home = NSHomeDirectory()
+        if p.hasPrefix("/System/Library/") { return "/System (protected)" }
+        if p.hasPrefix("/Library/Fonts")   { return "/Library/Fonts" }
+        if p.hasPrefix(home + "/Library/Fonts") { return "~/Library/Fonts" }
+        if p.contains("/Dropbox")          { return "Dropbox" }
+        if p.contains("/CloudStorage/")    { return "Cloud Drive" }
+        if p.contains("/RightFont/")       { return "RightFont library" }
+        return "Other"
+    }
+
+    /// Applies the current policy across every scanned group WITHOUT deleting,
+    /// so the consequences are visible before the button is pressed.
+    func previewPolicy() -> KeeperPolicyPreview {
+        var r = KeeperPolicyPreview()
+        r.groups = contentDuplicates.count
+        for g in contentDuplicates {
+            let keeper = recommendedKeeper(in: g)
+            r.keepersByLocation[Self.locationLabel(keeper), default: 0] += 1
+            if Self.isCloudSynced(keeper) { r.onlyCopyInCloud += 1 }
+            if !isReachable(keeper) { r.onlyCopyOffline += 1 }
+            if !Self.isCloudSynced(keeper) { r.onlyCopyOnSingleDisk += 1 }
+            for victim in g.paths where victim != keeper {
+                if itemsAtPath(victim).contains(where: { SystemFontGuard.isProtected($0) }) {
+                    r.protectedSkipped += 1
+                    continue
+                }
+                r.filesDeleted += 1
+                r.bytesReclaimed += g.size
+                r.deletionsByLocation[Self.locationLabel(victim), default: 0] += 1
+            }
+        }
+        return r
     }
 
     /// path → the faces parsed out of that file, built once per library
     /// version.
     ///
     /// `itemsAtPath` used to filter the whole library on every call. The
-    /// duplicates screen calls it per row, and the safety audit calls it once
-    /// per copy per group — at 23 644 groups over 106 950 faces that is about
-    /// 7 billion comparisons, which read exactly like a hang.
+    /// duplicates screen calls it per row, the policy scorer calls it per copy
+    /// per group, and the audit does the same — at 23 644 groups over 106 950
+    /// faces that is billions of comparisons, which reads exactly like a hang.
     private var facesByPathCache: (Int, [String: [FontItem]])? = nil
 
     private var facesByPath: [String: [FontItem]] {
