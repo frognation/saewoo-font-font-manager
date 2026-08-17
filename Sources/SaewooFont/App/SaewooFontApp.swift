@@ -21,6 +21,10 @@ struct SaewooFontApp: App {
             MainActor.assumeIsolated { Benchmark.run() }
             exit(0)
         }
+        if let f = ForkCLI.requestedArguments() {
+            ForkCLI.run(font: f.font, out: f.out, variable: f.variable)
+            exit(0)
+        }
         if DuplicateAuditCLI.requested() {
             let done = Flag()
             Task { @MainActor in
