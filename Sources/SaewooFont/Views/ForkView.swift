@@ -43,6 +43,7 @@ struct ForkView: View {
                 header
                 sourceSection
                 detectionCard
+                fidelityCard
                 glyphModeSection
                 identitySection
                 outputSection
@@ -86,6 +87,68 @@ struct ForkView: View {
             }
             .pickerStyle(.inline)
             .labelsHidden()
+        }
+    }
+
+    /// What survives the export, shown *before* the user commits.
+    ///
+    /// A UFO that opens in Glyphs looks like a complete export, so the missing
+    /// pieces only surface once redrawing has already started. Saying it up
+    /// front is worth more than any single extractor.
+    @ViewBuilder
+    private var fidelityCard: some View {
+        let items = resolvedItems()
+        if let first = items.first {
+            let f = UFOFidelity.inspect(item: first)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: f.hasLosses ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
+                        .foregroundStyle(f.hasLosses ? .orange : .green)
+                    Text("What carries over").font(.headline)
+                    if items.count > 1 {
+                        Text("· based on \(first.styleName)")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                fidelityRow("Glyphs", "\(f.glyphsExported) of \(f.glyphsInFont)",
+                            ok: f.glyphsExported >= f.glyphsInFont)
+                if f.compositeGlyphs > 0 {
+                    fidelityRow("Composites (accents)",
+                                f.compositesPreserved
+                                    ? "\(f.compositeGlyphs) kept as components"
+                                    : "\(f.compositeGlyphs) flattened — editing the base won't update them",
+                                ok: f.compositesPreserved)
+                }
+                switch f.kerningSource {
+                case .kernTable:
+                    fidelityRow("Kerning", "\(f.kerningPairs) pairs", ok: true)
+                case .gposOnly:
+                    fidelityRow("Kerning", "in GPOS — not extractable, will be lost", ok: false)
+                case .none:
+                    fidelityRow("Kerning", "none in this font", ok: true)
+                }
+                if !f.gsubFeatures.isEmpty {
+                    fidelityRow("OpenType features",
+                                "\(f.gsubFeatures.count) lost — " + f.gsubFeatures.prefix(8).joined(separator: " "),
+                                ok: false)
+                }
+            }
+            .padding(12)
+            .background((f.hasLosses ? Color.orange : Color.green).opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    @ViewBuilder
+    private func fidelityRow(_ label: String, _ value: String, ok: Bool) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: ok ? "checkmark.circle.fill" : "minus.circle.fill")
+                .font(.caption)
+                .foregroundStyle(ok ? Color.green : Color.orange)
+            Text(label).font(.caption).frame(width: 150, alignment: .leading)
+            Text(value).font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
         }
     }
 
