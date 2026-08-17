@@ -327,14 +327,20 @@ struct SidebarView: View {
 
     @ViewBuilder
     private func sourceRow(_ url: URL, removable: Bool) -> some View {
+        // Count stays sourced from the cache even when offline — a
+        // disconnected drive must not make its fonts vanish from the
+        // library, so we deliberately keep showing the last-known count
+        // (just visually marked as stale) rather than hiding it.
         let count = lib.itemCountInSource(url)
+        let status = lib.status(for: url)
+        let isOffline = status.isOffline
         let isRFLibrary = RightFontImporter.isLibrary(url)
         // RightFont libraries get a briefcase icon + purple tint so they
         // stand out from plain folders at a glance.
         let icon = isRFLibrary
             ? "briefcase.fill"
             : (removable ? "folder.badge.plus" : "folder")
-        let tint: Color = isRFLibrary ? .purple : .blue
+        let tint: Color = isOffline ? .secondary : (isRFLibrary ? .purple : .blue)
         // Strip the ".rightfontlibrary" suffix from the display label —
         // users don't need to see the extension in the sidebar.
         let label: String = {
@@ -348,6 +354,14 @@ struct SidebarView: View {
                 .foregroundStyle(tint)
                 .frame(width: 20)
             Text(label).font(.system(size: 13)).lineLimit(1)
+                .foregroundStyle(isOffline ? .secondary : .primary)
+            if isOffline {
+                Text("Offline")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Color.secondary, in: Capsule())
+            }
             Spacer(minLength: 4)
             if count > 0 {
                 Text("\(count)")
@@ -358,19 +372,23 @@ struct SidebarView: View {
             }
         }
         .padding(.vertical, 3)
+        .opacity(isOffline ? 0.5 : 1.0)
         .tag(SidebarItem.source(url))
-        .help(url.path)
+        .help(isOffline ? "\(url.path) — not currently reachable (unmounted volume or removed folder)" : url.path)
         .contextMenu {
             Button("Reveal in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([url])
             }
+            .disabled(isOffline)
             Divider()
             Button("Activate All in Folder") {
                 Task { await lib.setActiveMany(lib.itemsInSource(url), active: true) }
             }
+            .disabled(isOffline)
             Button("Deactivate All in Folder") {
                 Task { await lib.setActiveMany(lib.itemsInSource(url), active: false) }
             }
+            .disabled(isOffline)
             if isRFLibrary {
                 Divider()
                 Button("Import RightFont Collections as Palettes") {
@@ -380,6 +398,7 @@ struct SidebarView: View {
                         }
                     }
                 }
+                .disabled(isOffline)
             }
             Divider()
             if removable {

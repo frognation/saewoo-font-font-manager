@@ -444,7 +444,7 @@ private struct DuplicateFileRow: View {
                 : (selection.contains(item.id) ? Color.red.opacity(0.08) : Color.clear)
         )
         .contentShape(Rectangle())
-        .onTapGesture { sel.selectedFontID = item.id }
+        .onTapGesture { sel.select(item.id) }
     }
 
     @ViewBuilder

@@ -77,6 +77,14 @@ final class FontLibrary: ObservableObject {
     /// Not cached to disk; rebuilt from the current scan.
     @Published private(set) var orphanURLs: [URL] = []
 
+    /// Availability of every known scan root, keyed by `standardizedFileURL.path`.
+    /// Refreshed on a coarse timer and after every rescan — see
+    /// `refreshSourceStatuses()`. This is a low-frequency signal (a drive
+    /// unmounting), unlike `items`, so publishing it doesn't cost the other
+    /// views observing `FontLibrary`.
+    @Published private(set) var sourceStatuses: [String: SourceStatus] = [:]
+    private var sourceStatusTask: Task<Void, Never>?
+
     /// Preview prefs are persisted here but are NOT `@Published` — the live,
     /// high-frequency values live in `PreviewSettings` so that dragging the
     /// size slider cannot invalidate the sidebar. See `UIState.swift`.
@@ -167,6 +175,8 @@ final class FontLibrary: ObservableObject {
 
         // Re-apply activation state from last launch (session scope clears on logout).
         await reapplyActivations()
+
+        startSourceStatusMonitoring()
     }
 
     // MARK: - Scanning
@@ -210,6 +220,10 @@ final class FontLibrary: ObservableObject {
             + (result.orphanURLs.isEmpty ? "" : " · \(result.orphanURLs.count) orphan\(result.orphanURLs.count == 1 ? "" : "s")")
         isScanning = false
         saveCacheNow()
+        // A rescan is also the moment a root reappearing (drive remounted) or
+        // disappearing (drive ejected mid-scan) is most likely to be noticed,
+        // so refresh availability now rather than waiting for the next tick.
+        refreshSourceStatuses()
     }
 
     /// Re-points favorites / collections / variable instances at the new
@@ -473,6 +487,58 @@ final class FontLibrary: ObservableObject {
         let prefix = url.standardizedFileURL.path
         if let hit = sourceBuckets[prefix] { return hit.count }
         return items.reduce(0) { $0 + ($1.fileURL.path.hasPrefix(prefix) ? 1 : 0) }
+    }
+
+    // MARK: - Source availability
+
+    /// Current availability for a scan root, from the cache built by
+    /// `refreshSourceStatuses()`. Never stats the filesystem itself — safe to
+    /// call from a view body. Defaults to `.available` for a root we haven't
+    /// classified yet (e.g. the very first render before bootstrap's initial
+    /// check completes), so a brand-new source doesn't flash "Offline".
+    func status(for url: URL) -> SourceStatus {
+        sourceStatuses[url.standardizedFileURL.path] ?? .available
+    }
+
+    /// Re-checks every known scan root's reachability. Per root this is one
+    /// `stat` (via `SourceStatusChecker`) plus a lookup into the already-built
+    /// `sourceBuckets` — never a directory walk, so it's safe to run on a
+    /// timer even with tens of thousands of cached fonts.
+    ///
+    /// Deliberately does NOT touch `items`: an unmounted drive must not wipe
+    /// the cached FontItems for fonts that live on it. This only updates the
+    /// status map the sidebar reads to grey a row out.
+    func refreshSourceStatuses() {
+        var next: [String: SourceStatus] = [:]
+        for url in visibleDefaultSources + customScanPaths {
+            let path = url.standardizedFileURL.path
+            next[path] = SourceStatusChecker.classify(url, itemCount: itemCountInSource(url))
+        }
+        // Equatable check avoids publishing (and re-rendering the sidebar)
+        // when nothing actually changed, which is the common case on every
+        // 10s tick.
+        if next != sourceStatuses {
+            sourceStatuses = next
+        }
+    }
+
+    /// Starts the periodic reachability check. Idempotent — safe to call
+    /// again (e.g. if bootstrap ever re-ran) since it cancels any prior loop.
+    /// Not started from `init` on purpose: benchmarking builds a `FontLibrary`
+    /// without calling `bootstrap()`, and a background timer touching
+    /// `Persistence`-adjacent state during `--bench` is exactly the kind of
+    /// thing `Persistence.readOnly` exists to guard against elsewhere — no
+    /// sense running it where it isn't needed at all.
+    private func startSourceStatusMonitoring() {
+        refreshSourceStatuses()
+        sourceStatusTask?.cancel()
+        sourceStatusTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)  // ~10s
+                guard !Task.isCancelled, let self else { return }
+                self.refreshSourceStatuses()
+            }
+        }
     }
 
     /// Full item list for a scan root. Only for callers that genuinely need the

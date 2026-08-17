@@ -172,7 +172,7 @@ struct AdobeFontsView: View {
         }
         .padding(.horizontal, 16).padding(.vertical, 8)
         .contentShape(Rectangle())
-        .onTapGesture { sel.selectedFontID = item.id }
+        .onTapGesture { sel.select(item.id) }
         .background(sel.selectedFontID == item.id ? Color.accentColor.opacity(0.1) : .clear)
     }
 

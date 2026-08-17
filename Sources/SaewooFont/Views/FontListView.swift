@@ -1,33 +1,116 @@
 import SwiftUI
 import AppKit
 
+/// How a click should change the selection, derived from the modifier keys
+/// held at the moment of the tap.
+///
+/// SwiftUI's `onTapGesture` doesn't hand us the originating event, so we read
+/// `NSEvent.modifierFlags` — the current keyboard state — which is accurate at
+/// the instant the gesture fires.
+enum ClickIntent {
+    case replace   // plain click
+    case toggle    // ⌘
+    case extend    // ⇧
+
+    static var current: ClickIntent {
+        let f = NSEvent.modifierFlags
+        if f.contains(.command) { return .toggle }
+        if f.contains(.shift)   { return .extend }
+        return .replace
+    }
+}
+
 struct FontListView: View {
     @EnvironmentObject var lib: FontLibrary
+    @EnvironmentObject var sel: SelectionModel
     @State private var expandedFamilies: Set<String> = []
+
+    /// The on-screen row order, flattened. ⇧-click ranges are meaningless
+    /// unless they follow exactly what the user sees, so expanded families
+    /// contribute their faces here in display order.
+    private func visibleOrder(_ groups: [FontFamilyGroup]) -> [String] {
+        var out: [String] = []
+        out.reserveCapacity(groups.count)
+        for g in groups {
+            guard let primary = g.faces.first else { continue }
+            out.append(primary.id)
+            if expandedFamilies.contains(g.key) {
+                for f in g.faces where f.id != primary.id { out.append(f.id) }
+            }
+        }
+        return out
+    }
 
     var body: some View {
         let groups = lib.familyGroups
-        // `List` (NSTableView-backed) recycles rows. The previous
-        // ScrollView+LazyVStack realized a row on first scroll-past and never
-        // released it, so scrolling 4 000+ families grew memory monotonically.
-        List {
-            ForEach(groups) { group in
-                FamilyGroupRow(group: group,
-                               expanded: expandedFamilies.contains(group.key),
-                               toggleExpand: {
-                                   if expandedFamilies.contains(group.key) {
-                                       expandedFamilies.remove(group.key)
-                                   } else {
-                                       expandedFamilies.insert(group.key)
-                                   }
-                               })
-                    .listRowInsets(EdgeInsets())
-                    .listRowSeparator(.visible)
+        let order = visibleOrder(groups)
+        VStack(spacing: 0) {
+            if sel.count > 1 { selectionBar }
+            // `List` (NSTableView-backed) recycles rows. The previous
+            // ScrollView+LazyVStack realized a row on first scroll-past and
+            // never released it, so scrolling 4 000+ families grew memory
+            // monotonically.
+            List {
+                ForEach(groups) { group in
+                    FamilyGroupRow(group: group,
+                                   expanded: expandedFamilies.contains(group.key),
+                                   visibleOrder: order,
+                                   toggleExpand: {
+                                       if expandedFamilies.contains(group.key) {
+                                           expandedFamilies.remove(group.key)
+                                       } else {
+                                           expandedFamilies.insert(group.key)
+                                       }
+                                   })
+                        .listRowInsets(EdgeInsets())
+                        .listRowSeparator(.visible)
+                }
             }
+            .listStyle(.plain)
+            .environment(\.defaultMinListRowHeight, 1)
         }
-        .listStyle(.plain)
-        .environment(\.defaultMinListRowHeight, 1)
         .background(Color(NSColor.textBackgroundColor))
+        .onCopyCommand { [] }   // keeps the responder chain alive for shortcuts
+        .background(
+            // Invisible buttons purely to register ⌘A / Esc with the menu system.
+            Group {
+                Button("") { sel.selectAll(order) }
+                    .keyboardShortcut("a", modifiers: .command)
+                Button("") { sel.clear() }
+                    .keyboardShortcut(.escape, modifiers: [])
+            }
+            .opacity(0).frame(width: 0, height: 0)
+        )
+    }
+
+    /// Appears only for a multi-row selection, so the bulk actions are visible
+    /// rather than hidden behind a right-click.
+    private var selectionBar: some View {
+        HStack(spacing: 10) {
+            Text("\(sel.count) selected")
+                .font(.system(size: 12, weight: .medium))
+            Spacer()
+            Button {
+                let items = sel.selectedItems(in: lib.items)
+                Task { await lib.setActiveMany(items, active: true) }
+            } label: { Label("Activate", systemImage: "power.circle.fill") }
+            Button {
+                let items = sel.selectedItems(in: lib.items)
+                Task { await lib.setActiveMany(items, active: false) }
+            } label: { Label("Deactivate", systemImage: "power.circle") }
+            Menu("Add to Project") {
+                if lib.collections.isEmpty { Text("No projects").foregroundStyle(.secondary) }
+                ForEach(lib.collections) { p in
+                    Button(p.name) {
+                        lib.addToCollection(p.id, fontIDs: Array(sel.selectedIDs))
+                    }
+                }
+            }
+            .frame(width: 150)
+            Button("Clear") { sel.clear() }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 7)
+        .background(Color.accentColor.opacity(0.12))
     }
 }
 
@@ -37,7 +120,27 @@ struct FamilyGroupRow: View {
     @EnvironmentObject var preview: PreviewSettings
     let group: FontFamilyGroup
     let expanded: Bool
+    let visibleOrder: [String]
     let toggleExpand: () -> Void
+
+    /// Routes a row tap through the modifier keys.
+    private func handleClick(_ id: String) {
+        switch ClickIntent.current {
+        case .replace: sel.select(id)
+        case .toggle:  sel.toggle(id)
+        case .extend:  sel.extend(to: id, visibleOrder: visibleOrder)
+        }
+    }
+
+    /// What a context-menu action should apply to. Right-clicking inside an
+    /// existing multi-selection acts on the whole selection — right-clicking a
+    /// row outside it acts on just that row, which is the macOS convention.
+    private func actionTargets(for rowItems: [FontItem]) -> [FontItem] {
+        if sel.count > 1, rowItems.contains(where: { sel.isSelected($0.id) }) {
+            return sel.selectedItems(in: lib.items)
+        }
+        return rowItems
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -73,17 +176,15 @@ struct FamilyGroupRow: View {
             }
             .padding(.horizontal, 14).padding(.vertical, 6)
             .contentShape(Rectangle())
-            .onTapGesture {
-                sel.selectedFontID = primary.id
-            }
-            .background(sel.selectedFontID == primary.id ? Color.accentColor.opacity(0.12) : Color.clear)
-            .contextMenu { rowContextMenu(items: group.faces) }
+            .onTapGesture { handleClick(primary.id) }
+            .background(sel.isSelected(primary.id) ? Color.accentColor.opacity(0.18) : Color.clear)
+            .contextMenu { rowContextMenu(items: actionTargets(for: group.faces)) }
 
             if expanded {
                 ForEach(group.faces) { face in
-                    FaceRow(item: face)
+                    FaceRow(item: face, onClick: { handleClick(face.id) })
                         .padding(.leading, 44)
-                        .contextMenu { rowContextMenu(items: [face]) }
+                        .contextMenu { rowContextMenu(items: actionTargets(for: [face])) }
                 }
             }
         }
@@ -116,8 +217,10 @@ struct FamilyGroupRow: View {
 
     @ViewBuilder
     private func rowContextMenu(items: [FontItem]) -> some View {
-        Button("Activate") { Task { await lib.setActiveMany(items, active: true) } }
-        Button("Deactivate") { Task { await lib.setActiveMany(items, active: false) } }
+        let n = items.count
+        let suffix = n > 1 ? " (\(n))" : ""
+        Button("Activate" + suffix) { Task { await lib.setActiveMany(items, active: true) } }
+        Button("Deactivate" + suffix) { Task { await lib.setActiveMany(items, active: false) } }
         Divider()
         Menu("Add to Project") {
             if lib.collections.isEmpty { Text("No projects").foregroundStyle(.secondary) }
@@ -139,6 +242,7 @@ struct FaceRow: View {
     @EnvironmentObject var sel: SelectionModel
     @EnvironmentObject var preview: PreviewSettings
     let item: FontItem
+    let onClick: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -168,8 +272,8 @@ struct FaceRow: View {
         }
         .padding(.horizontal, 14).padding(.vertical, 4)
         .contentShape(Rectangle())
-        .background(sel.selectedFontID == item.id ? Color.accentColor.opacity(0.12) : Color.clear)
-        .onTapGesture { sel.selectedFontID = item.id }
+        .background(sel.isSelected(item.id) ? Color.accentColor.opacity(0.18) : Color.clear)
+        .onTapGesture { onClick() }
     }
 }
 

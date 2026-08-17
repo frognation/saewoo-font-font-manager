@@ -174,7 +174,7 @@ struct LargeFilesView: View {
         .padding(.horizontal, 16).padding(.vertical, 8)
         .background(selection.contains(item.id) ? Color.red.opacity(0.08) : Color.clear)
         .contentShape(Rectangle())
-        .onTapGesture { sel.selectedFontID = item.id }
+        .onTapGesture { sel.select(item.id) }
     }
 
     private var empty: some View {
