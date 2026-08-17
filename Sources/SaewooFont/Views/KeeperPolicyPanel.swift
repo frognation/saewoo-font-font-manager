@@ -12,7 +12,10 @@ struct KeeperPolicyPanel: View {
     @EnvironmentObject var lib: FontLibrary
     @State private var expanded = true
 
-    private var preview: KeeperPolicyPreview { lib.previewPolicy() }
+    /// Read the cached result — never recompute here. SwiftUI evaluates a
+    /// computed property several times per body pass, and this one walks
+    /// every duplicate group.
+    private var preview: KeeperPolicyPreview { lib.policyPreview ?? KeeperPolicyPreview() }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -40,6 +43,9 @@ struct KeeperPolicyPanel: View {
                 Text("어떤 사본을 남길지 전체 기준")
                     .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
+                if lib.isPreviewingPolicy {
+                    ProgressView().controlSize(.small).scaleEffect(0.7)
+                }
                 if preview.hasRisk {
                     Label("확인 필요", systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
@@ -147,7 +153,13 @@ struct KeeperPolicyPanel: View {
     private var outcome: some View {
         let p = preview
         return VStack(alignment: .leading, spacing: 8) {
-            Text("이 기준으로 하면").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text("이 기준으로 하면").font(.caption).foregroundStyle(.secondary)
+                if lib.isPreviewingPolicy {
+                    Text("계산 중…").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .opacity(lib.isPreviewingPolicy ? 0.6 : 1)
 
             row("삭제될 파일", "\(p.filesDeleted)개")
             row("회수 용량",

@@ -37,6 +37,8 @@ final class FontLibrary: ObservableObject {
         displayableSourcesCache = nil
         searchIndexCache = nil
         facesByPathCache = nil
+        reachabilityCache.removeAll()
+        pathFactsCache = nil
         invalidateDerivedViews()
     }
 
@@ -1124,11 +1126,136 @@ final class FontLibrary: ObservableObject {
         }
         contentDuplicates = groups
         duplicateScanProgress = nil
+        reachabilityCache.removeAll()
+        // Warm reachability here, while the user is still looking at the scan
+        // spinner. It's one stat per copy; paying it on the first policy
+        // preview instead would stall the rules panel on its first use.
+        duplicateScanProgress = DuplicateScanner.Progress(
+            stage: "Checking which copies are readable", done: 0, total: groups.count)
+        for (i, g) in groups.enumerated() {
+            for u in g.paths { _ = isReachable(u) }
+            if i % 2000 == 0 {
+                duplicateScanProgress = DuplicateScanner.Progress(
+                    stage: "Checking which copies are readable",
+                    done: i, total: groups.count)
+            }
+        }
+        duplicateScanProgress = nil
         isScanningDuplicates = false
+        schedulePolicyPreview()
     }
 
     @Published var keeperPolicy: KeeperPolicy = .load() {
-        didSet { keeperPolicy.save() }
+        didSet {
+            guard keeperPolicy != oldValue else { return }
+            keeperPolicy.save()
+            schedulePolicyPreview()
+        }
+    }
+
+    /// Last computed preview. The panel reads this instead of recomputing:
+    /// `previewPolicy()` walks every group, and SwiftUI reads a computed
+    /// property several times per body evaluation, so doing it inline meant
+    /// tens of thousands of group evaluations per keystroke.
+    @Published private(set) var policyPreview: KeeperPolicyPreview?
+    @Published private(set) var isPreviewingPolicy = false
+    private var policyPreviewTask: Task<Void, Never>?
+
+    /// Debounced so dragging a rule up and down doesn't queue a full pass per
+    /// intermediate state.
+    func schedulePolicyPreview() {
+        guard !contentDuplicates.isEmpty else { policyPreview = nil; return }
+        policyPreviewTask?.cancel()
+        isPreviewingPolicy = true
+        policyPreviewTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+
+            // Snapshot on the main actor, then compute off it. The pass takes
+            // ~550 ms at this library size, which is a visible hitch if it
+            // runs where the UI does.
+            let groups = contentDuplicates
+            let facts = pathFacts
+            let weights = keeperPolicy.resolvedWeights()
+            let requireReachable = keeperPolicy.requireReachableKeeper
+            let preferred = keeperPolicy.preferredFolder
+            // Reachability is a filesystem stat, so resolve it here (cached)
+            // rather than letting the background pass touch the disk.
+            var reach: [String: Bool] = [:]
+            for g in groups {
+                for u in g.paths { reach[u.path] = isReachable(u) }
+            }
+
+            let result = await Task.detached(priority: .userInitiated) {
+                Self.computePreview(groups: groups, facts: facts, weights: weights,
+                                    requireReachable: requireReachable,
+                                    preferred: preferred, reachable: reach)
+            }.value
+
+            guard !Task.isCancelled else { return }
+            policyPreview = result
+            isPreviewingPolicy = false
+        }
+    }
+
+    /// path → is it readable right now. Reachability needs a stat per file;
+    /// without this the scorer hit the disk once per copy per group per
+    /// render.
+    private var reachabilityCache: [String: Bool] = [:]
+
+    /// Everything the keeper scorer needs about one file, resolved once.
+    ///
+    /// Scoring used to re-derive all of this per copy per group: `itemsAtPath`
+    /// returns a fresh array (a file here can hold 252 faces), then several
+    /// `contains(where:)` passes ran over it, and rule weights did a linear
+    /// search of the rule order. Across 23 644 groups that was ~3 s per
+    /// preview — and the preview runs on every change in the rules panel.
+    /// Resolved once, scoring becomes arithmetic.
+    struct PathFacts {
+        var isProtected = false
+        var isCurated = false
+        var isCloud = false
+        var isUserFonts = false
+        var newest: TimeInterval = 0
+        var megabytes = 0
+    }
+    private var pathFactsCache: (derived: Int, membership: Int, facts: [String: PathFacts])?
+
+    private var pathFacts: [String: PathFacts] {
+        if let c = pathFactsCache, c.derived == derivedVersion, c.membership == membershipVersion {
+            return c.facts
+        }
+        let home = NSHomeDirectory() + "/Library/Fonts"
+        var collectionIDs = Set<String>()
+        for c in collections { collectionIDs.formUnion(c.fontIDs) }
+
+        var out: [String: PathFacts] = [:]
+        out.reserveCapacity(facesByPath.count)
+        for (path, faces) in facesByPath {
+            var f = PathFacts()
+            f.isCloud = path.contains("/CloudStorage/") || path.contains("/Dropbox")
+                || path.contains("/Library/Mobile Documents/")
+            f.isUserFonts = path.hasPrefix(home)
+            f.megabytes = Int((faces.first?.fileSize ?? 0) / 1_000_000)
+            for face in faces {
+                if !f.isProtected, SystemFontGuard.isProtected(face) { f.isProtected = true }
+                if !f.isCurated,
+                   favorites.contains(face.id) || activeFontIDs.contains(face.id)
+                       || collectionIDs.contains(face.id) { f.isCurated = true }
+                let t = face.dateAdded.timeIntervalSince1970
+                if t > f.newest { f.newest = t }
+            }
+            out[path] = f
+        }
+        pathFactsCache = (derivedVersion, membershipVersion, out)
+        return out
+    }
+
+    /// Installs scan results without re-running the scan. Used by the
+    /// `--scan-duplicates` audit so it can time the policy preview against a
+    /// real group set.
+    func installDuplicatesForAudit(_ groups: [DuplicateScanner.Group]) {
+        contentDuplicates = groups
     }
 
     /// Which copy to keep, under the user's policy.
@@ -1138,43 +1265,48 @@ final class FontLibrary: ObservableObject {
     /// outranks the policy: a SIP or macOS-essential file can't be the one
     /// that gets deleted, whatever the rules say.
     func recommendedKeeper(in group: DuplicateScanner.Group) -> URL {
-        let p = keeperPolicy
-        func score(_ url: URL) -> Int {
-            var s = 0
-            let faces = itemsAtPath(url)
-            if faces.contains(where: { SystemFontGuard.isProtected($0) }) { s += 1_000_000 }
-            // A copy on an offline source can't be the survivor if the user
-            // asked us not to strand the library there.
-            if p.requireReachableKeeper, !isReachable(url) { s -= 500_000 }
+        keeper(in: group, facts: pathFacts, weights: keeperPolicy.resolvedWeights(),
+               requireReachable: keeperPolicy.requireReachableKeeper,
+               preferred: keeperPolicy.preferredFolder).url
+    }
 
-            for rule in p.order where p.enabled.contains(rule) {
-                let w = p.weight(rule)
+    /// Hoisted inputs, and returns the path alongside the URL.
+    ///
+    /// Both matter at this scale. Re-reading `pathFacts` and rebuilding
+    /// `resolvedWeights()` per group cost an allocation each across 23 644
+    /// groups, and `URL.path` builds a fresh String every time it's touched —
+    /// the scorer reached for it about five times per group.
+    private func keeper(
+        in group: DuplicateScanner.Group,
+        facts: [String: PathFacts],
+        weights: [(KeeperPolicy.Rule, Int)],
+        requireReachable: Bool,
+        preferred: String?
+    ) -> (url: URL, path: String) {
+        var best = group.paths[0]
+        var bestPath = best.path
+        var bestScore = Int.min
+        for url in group.paths {
+            let path = url.path
+            let f = facts[path] ?? PathFacts()
+            var s = 0
+            if f.isProtected { s += 1_000_000 }
+            if requireReachable, !isReachable(url, path: path) { s -= 500_000 }
+            for (rule, w) in weights {
                 switch rule {
                 case .preferFolder:
-                    if let f = p.preferredFolder, url.path.hasPrefix(f) { s += w }
-                case .preferCloud:
-                    if Self.isCloudSynced(url) { s += w }
-                case .preferLocal:
-                    if !Self.isCloudSynced(url) { s += w }
-                case .preferUserFonts:
-                    if url.path.hasPrefix(NSHomeDirectory() + "/Library/Fonts") { s += w }
-                case .preferCurated:
-                    if faces.contains(where: { favorites.contains($0.id) })
-                        || faces.contains(where: { activeFontIDs.contains($0.id) })
-                        || faces.contains(where: { f in collections.contains { $0.fontIDs.contains(f.id) } }) {
-                        s += w
-                    }
-                case .preferNewest:
-                    if let newest = faces.map({ $0.dateAdded }).max() {
-                        s += w > 0 ? Int(newest.timeIntervalSince1970) / 100_000 : 0
-                    }
-                case .preferLargest:
-                    s += Int((faces.first?.fileSize ?? 0) / 1_000_000)
+                    if let pf = preferred, path.hasPrefix(pf) { s += w }
+                case .preferCloud:     if f.isCloud { s += w }
+                case .preferLocal:     if !f.isCloud { s += w }
+                case .preferUserFonts: if f.isUserFonts { s += w }
+                case .preferCurated:   if f.isCurated { s += w }
+                case .preferNewest:    s += Int(f.newest) / 100_000
+                case .preferLargest:   s += f.megabytes
                 }
             }
-            return s
+            if s > bestScore { bestScore = s; best = url; bestPath = path }
         }
-        return group.paths.max(by: { score($0) < score($1) }) ?? group.paths[0]
+        return (best, bestPath)
     }
 
     /// Is this copy actually usable right now?
@@ -1184,30 +1316,35 @@ final class FontLibrary: ObservableObject {
     /// register those — the font looks present and simply fails to activate.
     /// A materialized file has blocks allocated; a placeholder has ~none.
     ///
-    /// (Measured on this library: 300/300 sampled Dropbox fonts are fully
-    /// materialized, so a full-sync cloud folder is as usable as local disk —
-    /// and, being replicated across the cloud plus other machines, is more
-    /// durable than a single drive. "Cloud" alone is not the risk; an
-    /// unmaterialized or unmounted copy is.)
-    func isReachable(_ url: URL) -> Bool {
-        guard let v = try? url.resourceValues(forKeys: [.fileSizeKey, .isUbiquitousItemKey])
-        else { return false }
-        let logical = Int64(v.fileSize ?? 0)
-        guard logical > 0 else { return FileManager.default.fileExists(atPath: url.path) }
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let blocks = (attrs[.systemFileNumber] != nil)
-                  ? try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
-                        .totalFileAllocatedSize
-                  : nil
-        else { return FileManager.default.fileExists(atPath: url.path) }
-        // Allow for compression/sparse: anything above half the logical size
-        // is a real file, near-zero is a placeholder.
-        return Int64(blocks ?? 0) * 2 >= logical
+    /// Memoized: this is a filesystem stat, and the policy scorer asks about
+    /// every copy of every group. Uncached it made the rules panel unusable.
+    ///
+    /// (Measured here: 300/300 sampled Dropbox fonts are fully materialized,
+    /// so a full-sync cloud folder is as usable as local disk — and, being
+    /// replicated to the cloud and other machines, more durable than a single
+    /// drive. "Cloud" is not the risk; an unmaterialized or unmounted copy is.)
+    func isReachable(_ url: URL) -> Bool { isReachable(url, path: url.path) }
+
+    private func isReachable(_ url: URL, path: String) -> Bool {
+        if let hit = reachabilityCache[path] { return hit }
+        let ok: Bool
+        if let v = try? url.resourceValues(forKeys: [.fileSizeKey, .totalFileAllocatedSizeKey]),
+           let logical = v.fileSize, logical > 0 {
+            // Allow for compression/sparse files: anything above half the
+            // logical size is real, near-zero is a placeholder.
+            ok = Int64(v.totalFileAllocatedSize ?? 0) * 2 >= Int64(logical)
+        } else {
+            ok = FileManager.default.fileExists(atPath: path)
+        }
+        reachabilityCache[path] = ok
+        return ok
     }
 
     /// Short label for grouping deletions/keepers in the preview.
-    static func locationLabel(_ url: URL) -> String {
-        let p = url.path, home = NSHomeDirectory()
+    nonisolated static func locationLabel(_ url: URL) -> String { locationLabel(url.path) }
+
+    nonisolated static func locationLabel(_ p: String) -> String {
+        let home = NSHomeDirectory()
         if p.hasPrefix("/System/Library/") { return "/System (protected)" }
         if p.hasPrefix("/Library/Fonts")   { return "/Library/Fonts" }
         if p.hasPrefix(home + "/Library/Fonts") { return "~/Library/Fonts" }
@@ -1220,22 +1357,66 @@ final class FontLibrary: ObservableObject {
     /// Applies the current policy across every scanned group WITHOUT deleting,
     /// so the consequences are visible before the button is pressed.
     func previewPolicy() -> KeeperPolicyPreview {
-        var r = KeeperPolicyPreview()
-        r.groups = contentDuplicates.count
+        var reach: [String: Bool] = [:]
         for g in contentDuplicates {
-            let keeper = recommendedKeeper(in: g)
-            r.keepersByLocation[Self.locationLabel(keeper), default: 0] += 1
-            if Self.isCloudSynced(keeper) { r.onlyCopyInCloud += 1 }
-            if !isReachable(keeper) { r.onlyCopyOffline += 1 }
-            if !Self.isCloudSynced(keeper) { r.onlyCopyOnSingleDisk += 1 }
-            for victim in g.paths where victim != keeper {
-                if itemsAtPath(victim).contains(where: { SystemFontGuard.isProtected($0) }) {
-                    r.protectedSkipped += 1
-                    continue
+            for u in g.paths { reach[u.path] = isReachable(u) }
+        }
+        return Self.computePreview(
+            groups: contentDuplicates, facts: pathFacts,
+            weights: keeperPolicy.resolvedWeights(),
+            requireReachable: keeperPolicy.requireReachableKeeper,
+            preferred: keeperPolicy.preferredFolder, reachable: reach)
+    }
+
+    /// Pure — no actor state, no disk. Everything it needs is passed in so the
+    /// pass can run off the main actor.
+    nonisolated static func computePreview(
+        groups: [DuplicateScanner.Group],
+        facts: [String: PathFacts],
+        weights: [(KeeperPolicy.Rule, Int)],
+        requireReachable: Bool,
+        preferred: String?,
+        reachable: [String: Bool]
+    ) -> KeeperPolicyPreview {
+        var r = KeeperPolicyPreview()
+        r.groups = groups.count
+
+        for g in groups {
+            var best = g.paths[0]
+            var bestPath = best.path
+            var bestScore = Int.min
+            for url in g.paths {
+                let path = url.path
+                let f = facts[path] ?? PathFacts()
+                var s = 0
+                if f.isProtected { s += 1_000_000 }
+                if requireReachable, reachable[path] == false { s -= 500_000 }
+                for (rule, w) in weights {
+                    switch rule {
+                    case .preferFolder:
+                        if let pf = preferred, path.hasPrefix(pf) { s += w }
+                    case .preferCloud:     if f.isCloud { s += w }
+                    case .preferLocal:     if !f.isCloud { s += w }
+                    case .preferUserFonts: if f.isUserFonts { s += w }
+                    case .preferCurated:   if f.isCurated { s += w }
+                    case .preferNewest:    s += Int(f.newest) / 100_000
+                    case .preferLargest:   s += f.megabytes
+                    }
                 }
+                if s > bestScore { bestScore = s; best = url; bestPath = path }
+            }
+
+            let kf = facts[bestPath] ?? PathFacts()
+            r.keepersByLocation[locationLabel(bestPath), default: 0] += 1
+            if kf.isCloud { r.onlyCopyInCloud += 1 } else { r.onlyCopyOnSingleDisk += 1 }
+            if reachable[bestPath] == false { r.onlyCopyOffline += 1 }
+
+            for victim in g.paths where victim != best {
+                let vp = victim.path
+                if facts[vp]?.isProtected == true { r.protectedSkipped += 1; continue }
                 r.filesDeleted += 1
                 r.bytesReclaimed += g.size
-                r.deletionsByLocation[Self.locationLabel(victim), default: 0] += 1
+                r.deletionsByLocation[locationLabel(vp), default: 0] += 1
             }
         }
         return r
@@ -1245,9 +1426,9 @@ final class FontLibrary: ObservableObject {
     /// version.
     ///
     /// `itemsAtPath` used to filter the whole library on every call. The
-    /// duplicates screen calls it per row, the policy scorer calls it per copy
-    /// per group, and the audit does the same — at 23 644 groups over 106 950
-    /// faces that is billions of comparisons, which reads exactly like a hang.
+    /// duplicates screen calls it per row and the audit once per copy per
+    /// group — billions of comparisons at this library size, which reads
+    /// exactly like a hang.
     private var facesByPathCache: (Int, [String: [FontItem]])? = nil
 
     private var facesByPath: [String: [FontItem]] {

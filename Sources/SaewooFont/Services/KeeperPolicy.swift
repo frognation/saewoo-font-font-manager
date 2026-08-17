@@ -79,6 +79,14 @@ struct KeeperPolicy: Codable, Equatable {
         return (order.count - i) * 100
     }
 
+    /// Enabled rules with their weights, resolved once. The scorer runs per
+    /// copy per group, and `weight` does a linear search of `order`.
+    func resolvedWeights() -> [(Rule, Int)] {
+        order.enumerated()
+            .filter { enabled.contains($0.element) }
+            .map { ($0.element, (order.count - $0.offset) * 100) }
+    }
+
     // MARK: - Persistence
 
     private static let defaultsKey = "duplicates.keeperPolicy"

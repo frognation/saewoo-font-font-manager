@@ -92,6 +92,18 @@ enum DuplicateAuditCLI {
                 }
             }
         }
+        lib.installDuplicatesForAudit(groups)
+        // Policy preview timing — this runs on every rules-panel change, so
+        // it has to be cheap. It used to hit the disk once per copy per group.
+        var t = Date()
+        _ = lib.previewPolicy()
+        let cold = Date().timeIntervalSince(t) * 1000
+        t = Date()
+        _ = lib.previewPolicy()
+        let warm = Date().timeIntervalSince(t) * 1000
+        print(String(format: "\npolicy preview: cold %.0f ms · warm %.0f ms  (%d groups)",
+                     cold, warm, groups.count))
+
         print("\n--- safety audit ---")
         print("groups with no valid keeper            : \(noKeeper)      (must be 0)")
         print("faces whose twin survives in the keeper: \(facesPreserved)")
