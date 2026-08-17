@@ -1441,7 +1441,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
         case .orphans:     return "Orphan Files"
         case .missingRefs: return "Missing References"
         case .largeFiles:  return "Largest Files"
-        case .fork:        return "Fork (UFO / Designspace)"
+        case .fork:        return "Fork → Type Forker"
         }
     }
     var icon: String {

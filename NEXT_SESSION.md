@@ -106,7 +106,13 @@ debug 빌드 수치는 의미 없음.
 
 ## 우선순위 (HANDOFF.md "Session 4" + "Queued for the next session" 종합)
 
-  0. **(최우선·결정 필요) Fork를 별도 툴로 뺄지 결정.** `949b713`까지에서 글리프
+  0. **(완료) Fork 분리됨** → `~/Documents/GitHub/Projects/type-forker`.
+     이 리포지토리에서는 Tools의 `Fork → Type Forker` 실행 화면만 남았음
+     (`Views/ForkLauncherView.swift`). Fork 관련 소스 6개는 삭제됨.
+     이어서 작업하려면 **type-forker 폴더를 열고 그쪽 README부터** 읽을 것.
+     착수 전 Glyphs 3 검증 6항목 필수.
+
+  0-old. (기록용) 분리 판단 근거. `949b713`까지에서 글리프
      누락(517→657/657)과 composite 구조 보존(TrueType 528개)은 해결됐고,
      내보내기 전 손실 안내도 붙었음. 남은 갭은 GPOS 커닝 / `features.fea` /
      CFF composite.

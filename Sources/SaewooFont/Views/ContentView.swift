@@ -15,7 +15,7 @@ struct ContentView: View {
         case .tool(.orphans):     OrphansView()
         case .tool(.missingRefs): MissingRefsView()
         case .tool(.largeFiles):  LargeFilesView()
-        case .tool(.fork):        ForkView()
+        case .tool(.fork):        ForkLauncherView()
         case .cloud(.google):     GoogleFontsView()
         case .cloud(.adobe):      AdobeFontsView()
         default:                  FontListView()
