@@ -149,15 +149,10 @@ struct SidebarView: View {
                     foundryRow(name: name, count: count)
                 }
             }
+            // One section, not two: Palettes were merged into Projects.
             subSection(id: "lib-projects", title: "Projects",
                        trailing: { addCollectionButton(.project) }) {
-                ForEach(lib.collections.filter { $0.kind == .project }) { c in
-                    collectionRow(c)
-                }
-            }
-            subSection(id: "lib-palettes", title: "Palettes",
-                       trailing: { addCollectionButton(.palette) }) {
-                ForEach(lib.collections.filter { $0.kind == .palette }) { c in
+                ForEach(lib.collections) { c in
                     collectionRow(c)
                 }
             }
@@ -297,7 +292,7 @@ struct SidebarView: View {
             }
         } label: { Image(systemName: "plus") }
             .buttonStyle(.plain)
-            .help(kind == .project ? "New project" : "New palette")
+            .help("New project")
     }
 
     // MARK: - Rows
@@ -403,7 +398,7 @@ struct SidebarView: View {
         let alert = NSAlert()
         alert.messageText = "Imported “\(r.libraryName)”"
         alert.informativeText = """
-        \(r.paletteCount) palette\(r.paletteCount == 1 ? "" : "s") created.
+        \(r.paletteCount) project\(r.paletteCount == 1 ? "" : "s") created.
         \(r.enrichedCount) font\(r.enrichedCount == 1 ? "" : "s") matched to RightFont metadata.
         \(r.starredMatchCount) starred font\(r.starredMatchCount == 1 ? "" : "s") added to Favorites.
         \(r.skippedCount == 0 ? "" : "\(r.skippedCount) empty/unresolved fontlist\(r.skippedCount == 1 ? "" : "s") skipped.")
@@ -512,7 +507,7 @@ struct SidebarView: View {
                 }
             }
             Divider()
-            Button("Delete \(c.kind == .project ? "Project" : "Palette")", role: .destructive) {
+            Button("Delete Project", role: .destructive) {
                 lib.deleteCollection(c.id)
             }
         }

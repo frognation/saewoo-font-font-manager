@@ -149,6 +149,14 @@ final class FontLibrary: ObservableObject {
         self.previewText = state.userText.isEmpty ? previewText : state.userText
         self.previewSize = state.previewSize > 0 ? state.previewSize : previewSize
 
+        // Palettes were merged into Projects — fold any legacy ones over.
+        var migrated = false
+        for i in collections.indices where collections[i].kind == .palette {
+            collections[i].kind = .project
+            migrated = true
+        }
+        if migrated { persist() }
+
         if let cached = await Persistence.loadCachedLibraryOffMain(), !cached.isEmpty,
            !Self.cacheLooksStale(cached) {
             self.items = cached
@@ -641,8 +649,7 @@ final class FontLibrary: ObservableObject {
         }
         for c in collections {
             for id in c.fontIDs where !existing.contains(id) {
-                let kind = c.kind == .project ? "Project" : "Palette"
-                map[id, default: []].append("\(kind): \(c.name)")
+                map[id, default: []].append("Project: \(c.name)")
             }
         }
         for vi in variableInstances where !existing.contains(vi.baseFontID) {
@@ -826,13 +833,11 @@ final class FontLibrary: ObservableObject {
             guard !mappedIDs.isEmpty else { skipped += 1; continue }
 
             let paletteName = palettePrefix + name
-            if let existingIdx = collections.firstIndex(where: {
-                $0.kind == .palette && $0.name == paletteName
-            }) {
+            if let existingIdx = collections.firstIndex(where: { $0.name == paletteName }) {
                 collections[existingIdx].fontIDs = mappedIDs
             } else {
                 collections.append(FontCollection(
-                    name: paletteName, kind: .palette,
+                    name: paletteName, kind: .project,
                     colorHex: Self.rotatingPaletteColor(seed: collections.count),
                     fontIDs: mappedIDs
                 ))
@@ -1049,13 +1054,11 @@ final class FontLibrary: ObservableObject {
         var n = 0
         for (name, ids) in merged {
             let paletteName = prefix + name
-            if let idx = collections.firstIndex(where: {
-                $0.kind == .palette && $0.name == paletteName
-            }) {
+            if let idx = collections.firstIndex(where: { $0.name == paletteName }) {
                 collections[idx].fontIDs = ids
             } else {
                 collections.append(FontCollection(
-                    name: paletteName, kind: .palette,
+                    name: paletteName, kind: .project,
                     colorHex: Self.rotatingPaletteColor(seed: collections.count),
                     fontIDs: ids
                 ))

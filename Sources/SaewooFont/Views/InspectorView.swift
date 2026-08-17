@@ -76,7 +76,7 @@ struct InspectorView: View {
                         Text("Collections").font(.headline)
                         let memberships = lib.collections.filter { $0.fontIDs.contains(item.id) }
                         if memberships.isEmpty {
-                            Text("Not in any project or palette yet.")
+                            Text("Not in any project yet.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         ForEach(memberships) { c in

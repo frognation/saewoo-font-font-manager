@@ -120,16 +120,8 @@ struct FamilyGroupRow: View {
         Button("Deactivate") { Task { await lib.setActiveMany(items, active: false) } }
         Divider()
         Menu("Add to Project") {
-            let projects = lib.collections.filter { $0.kind == .project }
-            if projects.isEmpty { Text("No projects").foregroundStyle(.secondary) }
-            ForEach(projects) { p in
-                Button(p.name) { lib.addToCollection(p.id, fontIDs: items.map { $0.id }) }
-            }
-        }
-        Menu("Add to Palette") {
-            let palettes = lib.collections.filter { $0.kind == .palette }
-            if palettes.isEmpty { Text("No palettes").foregroundStyle(.secondary) }
-            ForEach(palettes) { p in
+            if lib.collections.isEmpty { Text("No projects").foregroundStyle(.secondary) }
+            ForEach(lib.collections) { p in
                 Button(p.name) { lib.addToCollection(p.id, fontIDs: items.map { $0.id }) }
             }
         }

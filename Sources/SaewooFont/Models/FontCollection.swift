@@ -2,6 +2,11 @@ import Foundation
 
 /// Named, toggleable group of fonts. Used for Projects and Palettes.
 struct FontCollection: Identifiable, Codable, Hashable {
+    /// `palette` is retained for decoding only. Projects and palettes were
+    /// always the same thing — a named, togglable set of faces — and the split
+    /// bought nothing but a duplicated sidebar section and two identical
+    /// "Add to…" menus. `FontLibrary.bootstrap()` migrates any stored palette
+    /// to `.project`; nothing creates `.palette` any more.
     enum Kind: String, Codable { case project, palette }
 
     var id: UUID
