@@ -41,11 +41,14 @@ enum RightFontImporter {
 
     // MARK: - Manifest
 
+    /// Deliberately does NOT decode RightFont's `createdBy` / `modifiedBy`
+    /// fields. Those hold the personal names of whoever built the library at
+    /// the original studio, and we have no reason to read — let alone keep —
+    /// them. `Decodable` ignores unknown keys, so dropping them here means the
+    /// names never enter this process at all.
     struct Manifest: Decodable {
         var name: String?
         var uuid: String?
-        var createdBy: String?
-        var modifiedBy: String?
         var created: Double?
         var modified: Double?
         var kind: String?
@@ -129,6 +132,7 @@ enum RightFontImporter {
 
     // MARK: - Font lists (collections)
 
+    /// Same rationale as `Manifest`: no `createdBy` / `modifiedBy`.
     struct FontListEntry: Decodable {
         var uuid: String?
         var name: String?
@@ -136,8 +140,6 @@ enum RightFontImporter {
         var parent: String?
         var fonts: [String]?           // hyphen-less font UUIDs
         var type: Int?
-        var createdBy: String?
-        var modifiedBy: String?
     }
 
     static func parseAllFontLists(in bundle: URL) -> [FontListEntry] {

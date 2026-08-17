@@ -815,7 +815,14 @@ final class FontLibrary: ObservableObject {
             guard let name = list.name, let fonts = list.fonts, !fonts.isEmpty else {
                 skipped += 1; continue
             }
-            let mappedIDs: Set<String> = Set(fonts.compactMap { uuidToOurID[$0.uppercased()] })
+            // normalizeUUID, not uppercased(): `parseAllFontEntries` keys its
+            // map by hyphen-stripped UUID, while fontlists store hyphenated
+            // ones. Uppercasing alone matched only the minority of lists whose
+            // UUIDs happened to already be hyphen-less — on a real 313-list
+            // library this silently imported 90 instead of 158.
+            let mappedIDs: Set<String> = Set(fonts.compactMap {
+                uuidToOurID[RightFontImporter.normalizeUUID($0)]
+            })
             guard !mappedIDs.isEmpty else { skipped += 1; continue }
 
             let paletteName = palettePrefix + name
@@ -1013,6 +1020,59 @@ final class FontLibrary: ObservableObject {
             invalidateDerived()
         }
         scheduleCacheSave()
+    }
+
+    // MARK: - Bulk import helpers
+
+    /// Creates one palette per entry, prefixed with the source library name so
+    /// imported sets stay visually grouped. Re-running updates an existing
+    /// palette of the same name rather than duplicating it.
+    @discardableResult
+    func importPalettes(_ palettes: [(String, Set<String>)], libraryName: String) -> Int {
+        let prefix = "[\(libraryName)] "
+        // Merge same-named entries *within this run* before touching the store.
+        // RightFont fontlists are a folder tree, so the same leaf name can
+        // legitimately appear under several parents. Replacing instead of
+        // merging silently collapsed 155 imported lists into 88 palettes and
+        // discarded the membership of everything that lost the race.
+        var merged: [(String, Set<String>)] = []
+        var indexByName: [String: Int] = [:]
+        for (name, ids) in palettes {
+            if let i = indexByName[name] {
+                merged[i].1.formUnion(ids)
+            } else {
+                indexByName[name] = merged.count
+                merged.append((name, ids))
+            }
+        }
+
+        var n = 0
+        for (name, ids) in merged {
+            let paletteName = prefix + name
+            if let idx = collections.firstIndex(where: {
+                $0.kind == .palette && $0.name == paletteName
+            }) {
+                collections[idx].fontIDs = ids
+            } else {
+                collections.append(FontCollection(
+                    name: paletteName, kind: .palette,
+                    colorHex: Self.rotatingPaletteColor(seed: collections.count),
+                    fontIDs: ids
+                ))
+            }
+            n += 1
+        }
+        invalidateMembership()
+        persist()
+        return n
+    }
+
+    func addFavorites(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        favorites.formUnion(ids)
+        favoritesVersion &+= 1
+        invalidateMembership()
+        persist()
     }
 
     // MARK: - Benchmark support (see Benchmark.swift / `--bench`)

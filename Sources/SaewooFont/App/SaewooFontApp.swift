@@ -21,6 +21,20 @@ struct SaewooFontApp: App {
             MainActor.assumeIsolated { Benchmark.run() }
             exit(0)
         }
+        // Headless RightFont import — see RightFontImportCLI.
+        if let args = RightFontImportCLI.requestedArguments() {
+            // Pump the run loop rather than blocking on a semaphore: the work
+            // is @MainActor, so parking the main thread would deadlock it.
+            let done = Flag()
+            Task { @MainActor in
+                await RightFontImportCLI.run(bundle: args.bundle, map: args.map)
+                done.value = true
+            }
+            while !done.value {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            }
+            exit(0)
+        }
     }
 
     var body: some Scene {
