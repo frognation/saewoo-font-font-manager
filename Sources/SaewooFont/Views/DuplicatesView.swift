@@ -1,136 +1,119 @@
 import SwiftUI
 import AppKit
 
-/// How to pick the "winner" from each duplicate group when bulk-selecting extras.
-enum KeepStrategy: String, CaseIterable, Identifiable {
-    case composite        // favorited > active > user-folder > newest
-    case newest           // latest dateAdded
-    case userFolder       // anything inside ~/Library/Fonts wins
-    case largest          // biggest file size (often most feature-complete)
-    case minimizeSystem   // prefer to REMOVE copies under /Library or /System/Library,
-                          // keeping whatever lives in ~/Library/Fonts or custom paths.
-                          // Never targets essential macOS UI fonts.
-
-    var id: String { rawValue }
-    var label: String {
-        switch self {
-        case .composite:      return "Smart — keep favorite/active/newest"
-        case .newest:         return "Keep the newest"
-        case .userFolder:     return "Keep the one in ~/Library/Fonts"
-        case .largest:        return "Keep the largest file"
-        case .minimizeSystem: return "Minimize system folders (remove /Library & /System copies)"
-        }
-    }
-    var shortLabel: String {
-        switch self {
-        case .composite:      return "Smart"
-        case .newest:         return "Newest"
-        case .userFolder:     return "User folder"
-        case .largest:        return "Largest"
-        case .minimizeSystem: return "Minimize system"
-        }
-    }
-    var explanation: String {
-        switch self {
-        case .composite:
-            return "Keeps the one that's favorited > active > in your user Fonts folder > newest. Best default for most people."
-        case .newest:
-            return "Keeps whichever file was added most recently. Good after bulk updates from a foundry."
-        case .userFolder:
-            return "Keeps the copy inside ~/Library/Fonts over any system or vendor-installed copies."
-        case .largest:
-            return "Keeps the bigger file — usually the one with more OpenType features or language coverage."
-        case .minimizeSystem:
-            return "Targets duplicates in /Library/Fonts (and /System/Library/Fonts, though SIP usually blocks those) for removal. Always keeps essential macOS fonts — SF Pro, Helvetica, emoji, CJK — even if they look like extras."
-        }
-    }
-}
-
+/// Byte-identical file cleanup.
+///
+/// The previous version of this screen grouped by PostScript name and offered
+/// to delete the "extras". On the reference library that was actively unsafe:
+/// only ~66 % of same-name groups were actually the same font, so a third of
+/// every deletion was a different typeface that merely reused the name. Worse,
+/// it counted faces but deleted files — and one file here holds 252 faces, so
+/// removing a single "extra" could take 251 unrelated ones with it.
+///
+/// This version only ever offers files whose contents hash identically. That
+/// makes deletion lossless by construction: every face in a removed file still
+/// exists, byte for byte, in the copy that is kept.
 struct DuplicatesView: View {
     @EnvironmentObject var lib: FontLibrary
 
-    @State private var strategy: KeepStrategy = .composite
-    @State private var selection: Set<String> = []
-    @State private var pendingBatch: [FontItem] = []
-    @State private var deleteError: String? = nil
-    @State private var lastDeleteReport: String? = nil
+    /// Group digest → the copy the user wants to keep.
+    @State private var keepers: [String: URL] = [:]
+    /// Group digests excluded from the purge.
+    @State private var excluded: Set<String> = []
+    @State private var confirming = false
+    @State private var report: FontLibrary.DuplicateDeletionReport?
+
+    private var groups: [DuplicateScanner.Group] { lib.contentDuplicates }
+
+    private func keeper(for g: DuplicateScanner.Group) -> URL {
+        keepers[g.digest] ?? lib.recommendedKeeper(in: g)
+    }
+
+    private var pending: [(group: DuplicateScanner.Group, keeper: URL)] {
+        groups.filter { !excluded.contains($0.digest) }
+              .map { ($0, keeper(for: $0)) }
+    }
+
+    private var reclaimable: Int64 {
+        pending.reduce(0) { $0 + $1.group.size * Int64($1.group.paths.count - 1) }
+    }
+    private var deletableCount: Int {
+        pending.reduce(0) { $0 + $1.group.paths.count - 1 }
+    }
 
     var body: some View {
-        let groups = lib.duplicateGroups
         VStack(spacing: 0) {
-            header(groupCount: groups.count,
-                   fileCount: groups.reduce(0) { $0 + $1.items.count })
-            if !groups.isEmpty {
-                Divider()
-                actionBar(groups: groups)
-            }
+            header
             Divider()
-            if groups.isEmpty {
-                emptyState
+            if lib.isScanningDuplicates {
+                scanning
+            } else if groups.isEmpty {
+                idle
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(groups, id: \.name) { group in
-                            DuplicateGroupRow(group: group,
-                                              winner: winner(in: group.items),
-                                              selection: $selection)
-                            Divider().opacity(0.4)
-                        }
-                    }
-                }
-                .background(Color(NSColor.textBackgroundColor))
+                actionBar
+                Divider()
+                list
             }
         }
         .confirmationDialog(
-            "Move \(pendingBatch.count) file\(pendingBatch.count == 1 ? "" : "s") to Trash?",
-            isPresented: Binding(
-                get: { !pendingBatch.isEmpty },
-                set: { if !$0 { pendingBatch = [] } }
-            )
+            "Move \(deletableCount) identical file\(deletableCount == 1 ? "" : "s") to Trash?",
+            isPresented: $confirming
         ) {
             Button("Move to Trash", role: .destructive) {
-                let batch = pendingBatch
-                pendingBatch = []
-                Task { await performBatchDelete(batch) }
+                let batch = pending
+                Task { report = await lib.deleteDuplicates(batch) }
             }
-            Button("Cancel", role: .cancel) { pendingBatch = [] }
+            Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This moves every selected file to Trash — reversible from Finder. Active/favorite/collection references are cleaned up automatically.")
+            Text("""
+            Every file listed is byte-for-byte identical to the copy being kept, \
+            so nothing is lost — each removed face still exists in the keeper. \
+            Files go to the Trash, and a manifest of deleted → kept paths is saved. \
+            Favorites and projects are re-pointed at the surviving copy automatically.
+            """)
         }
-        .alert("Some deletions failed",
-               isPresented: Binding(
-                get: { deleteError != nil },
-                set: { if !$0 { deleteError = nil } }
-               )) {
-            Button("OK") { deleteError = nil }
+        .alert("Cleanup finished", isPresented: Binding(
+            get: { report != nil }, set: { if !$0 { report = nil } })
+        ) {
+            Button("OK") { report = nil }
         } message: {
-            Text(deleteError ?? "")
+            if let r = report { Text(summary(r)) }
         }
     }
 
-    // MARK: - Subviews
+    private func summary(_ r: FontLibrary.DuplicateDeletionReport) -> String {
+        var s = "\(r.filesDeleted) files moved to Trash · "
+        s += ByteCountFormatter.string(fromByteCount: r.bytesReclaimed, countStyle: .file)
+        s += " reclaimed.\n\(r.referencesRemapped) favorite/project references re-pointed at the kept copy."
+        if !r.skipped.isEmpty { s += "\n\nSkipped:\n" + r.skipped.prefix(5).joined(separator: "\n") }
+        if !r.errors.isEmpty  { s += "\n\nFailed:\n"  + r.errors.prefix(5).joined(separator: "\n") }
+        return s
+    }
 
-    @ViewBuilder
-    private func header(groupCount: Int, fileCount: Int) -> some View {
+    // MARK: - Chrome
+
+    private var header: some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Image(systemName: "doc.on.doc")
-                    Text("Duplicate PostScript Names").font(.title3).bold()
+                    Text("Identical Files").font(.title3).bold()
                 }
-                Text("Files sharing the same PostScript name. The OS picks one and ignores the rest — the extras waste disk space and cause \"wrong glyphs\" bugs. Choose a Keep strategy, then Delete Extras to purge.")
+                Text("""
+                Finds files whose contents are byte-for-byte identical, so removing \
+                the extras cannot lose a font. Fonts that merely share a PostScript \
+                name are deliberately NOT listed here — those are usually different \
+                typefaces reusing a name, and deleting them loses real data.
+                """)
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                if let report = lastDeleteReport {
-                    Text(report).font(.caption).foregroundStyle(.green)
-                }
             }
             Spacer()
-            if groupCount > 0 {
+            if !groups.isEmpty {
                 VStack(alignment: .trailing, spacing: 2) {
-                    Text("\(groupCount) group\(groupCount == 1 ? "" : "s")")
-                        .font(.caption).bold()
-                    Text("\(fileCount) files · \(totalExtras()) extras")
+                    Text("\(groups.count) groups").font(.caption).bold()
+                    Text(ByteCountFormatter.string(fromByteCount: reclaimable, countStyle: .file)
+                         + " reclaimable")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
@@ -138,342 +121,158 @@ struct DuplicatesView: View {
         .padding(.horizontal, 16).padding(.vertical, 14)
     }
 
-    @ViewBuilder
-    private func actionBar(groups: [(name: String, items: [FontItem])]) -> some View {
-        HStack(spacing: 10) {
-            // Strategy menu
-            Menu {
-                ForEach(KeepStrategy.allCases) { s in
-                    Button { strategy = s } label: {
-                        if strategy == s {
-                            Label(s.label, systemImage: "checkmark")
-                        } else {
-                            Text(s.label)
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "crown")
-                    Text("Keep: \(strategy.shortLabel)")
-                    Image(systemName: "chevron.down").font(.caption2)
+    private var scanning: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+            if let p = lib.duplicateScanProgress {
+                Text(p.stage).font(.callout)
+                if p.total > 0 {
+                    ProgressView(value: Double(p.done), total: Double(p.total))
+                        .frame(width: 320)
+                    Text("\(p.done) / \(p.total)")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            .menuStyle(.borderlessButton)
-            .frame(width: 190)
-            .help(strategy.explanation)
-
-            Text(strategy.explanation)
+            Text("Only files that share a size are read, and only their first and last 16 KB unless those match.")
                 .font(.caption2).foregroundStyle(.secondary)
-                .lineLimit(2)
-                .layoutPriority(0)
+                .multilineTextAlignment(.center).frame(maxWidth: 380)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
-            Spacer()
-
-            Button {
-                selectAllExtras(groups: groups)
-            } label: {
-                // Show deletable count — protected files are excluded from
-                // bulk selection so the number reflects what will actually go.
-                Label("Select Extras (\(deletableExtrasCount(groups)))",
-                      systemImage: "checkmark.circle")
-            }
-            .disabled(deletableExtrasCount(groups) == 0)
-            .help("Selects every non-winner file that is safe to delete. Essential macOS fonts and SIP-locked files are skipped.")
-
-            Button {
-                selection.removeAll()
-            } label: { Text("Clear") }
-                .disabled(selection.isEmpty)
-
-            Button(role: .destructive) {
-                pendingBatch = groups.flatMap { $0.items }.filter { selection.contains($0.id) }
-            } label: {
-                Label("Delete \(selection.count) Selected",
-                      systemImage: "trash")
+    private var idle: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "doc.on.doc")
+                .font(.system(size: 42)).foregroundStyle(.secondary)
+            Text("No scan yet").font(.title3).bold()
+            Text("Comparing contents means reading the files, so it runs on demand.")
+                .font(.caption).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 360)
+            Button("Scan for identical files") {
+                Task { await lib.scanContentDuplicates() }
             }
             .buttonStyle(.borderedProminent)
-            .tint(.red)
-            .disabled(selection.isEmpty)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var actionBar: some View {
+        HStack(spacing: 10) {
+            Button("Rescan") { Task { await lib.scanContentDuplicates() } }
+            Text("Click any copy to make it the one that's kept.")
+                .font(.caption2).foregroundStyle(.secondary)
+            Spacer()
+            Button("Select All") { excluded.removeAll() }
+                .disabled(excluded.isEmpty)
+            Button("Deselect All") { excluded = Set(groups.map { $0.digest }) }
+                .disabled(excluded.count == groups.count)
+            Button(role: .destructive) { confirming = true } label: {
+                Label("Delete \(deletableCount) Extra Copies", systemImage: "trash")
+            }
+            .buttonStyle(.borderedProminent).tint(.red)
+            .disabled(deletableCount == 0)
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
         .background(Color(NSColor.windowBackgroundColor))
-        .environment(\.duplicatesSelection, $selection)
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "checkmark.seal.fill")
-                .font(.system(size: 44))
-                .foregroundStyle(.green)
-            Text("No duplicates").font(.title3).bold()
-            Text("Every font in your library has a unique PostScript name. Nothing to clean up.")
-                .font(.caption).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 340)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(NSColor.textBackgroundColor))
-    }
-
-    // MARK: - Logic
-
-    private func winner(in group: [FontItem]) -> FontItem {
-        switch strategy {
-        case .newest:
-            return group.max { $0.dateAdded < $1.dateAdded } ?? group[0]
-        case .largest:
-            return group.max { $0.fileSize < $1.fileSize } ?? group[0]
-        case .userFolder:
-            if let u = group.first(where: { SystemFontGuard.isInUserFolder($0.fileURL) }) { return u }
-            // fall through to newest as tiebreaker
-            return group.max { $0.dateAdded < $1.dateAdded } ?? group[0]
-        case .composite:
-            // favorited > active > user-folder > newest
-            if let fav = group.first(where: { lib.favorites.contains($0.id) }) { return fav }
-            if let act = group.first(where: { lib.isActive($0) }) { return act }
-            if let u = group.first(where: { SystemFontGuard.isInUserFolder($0.fileURL) }) { return u }
-            return group.max { $0.dateAdded < $1.dateAdded } ?? group[0]
-        case .minimizeSystem:
-            // Goal: keep as little as possible under system folders.
-            //
-            // Priority order for the keeper:
-            //   1. Any essential font (they can never be the "extra" — so if one
-            //      exists in the group, it must be the keeper regardless of
-            //      location). Otherwise we'd leave a broken group.
-            //   2. A file in ~/Library/Fonts or a user custom path.
-            //   3. A file in /Library/Fonts (admin area) — keeping it means we
-            //      remove only the SIP-protected sibling, which will silently
-            //      fail; the row surfaces this to the user.
-            //   4. Newest as a final tiebreaker.
-            if let ess = group.first(where: { SystemFontGuard.isEssential($0) }) { return ess }
-            if let u = group.first(where: { SystemFontGuard.isInUserFolder($0.fileURL) }) { return u }
-            if let shared = group.first(where: {
-                SystemFontGuard.location(of: $0.fileURL) == .systemShared
-            }) { return shared }
-            return group.max { $0.dateAdded < $1.dateAdded } ?? group[0]
-        }
-    }
-
-    /// Collects the "extras" (non-winner, non-protected) for every group.
-    /// Essentials and SIP-protected files are silently excluded from the
-    /// selection so the user can't accidentally click Delete and brick their UI.
-    private func selectAllExtras(groups: [(name: String, items: [FontItem])]) {
-        var ids: Set<String> = []
-        for group in groups {
-            let keeper = winner(in: group.items)
-            for item in group.items where item.id != keeper.id {
-                // Never queue a protected file. The row UI will also show why.
-                if SystemFontGuard.isProtected(item) { continue }
-                ids.insert(item.id)
+    private var list: some View {
+        List {
+            ForEach(groups) { g in
+                DuplicateGroupRow(group: g,
+                                  keeper: keeper(for: g),
+                                  included: !excluded.contains(g.digest),
+                                  setKeeper: { keepers[g.digest] = $0 },
+                                  toggleIncluded: {
+                                      if excluded.contains(g.digest) { excluded.remove(g.digest) }
+                                      else { excluded.insert(g.digest) }
+                                  })
+                    .listRowInsets(EdgeInsets())
             }
         }
-        selection = ids
-    }
-
-    /// Count of extras that could actually be deleted under the current
-    /// strategy — excludes essentials and SIP-locked files. This drives the
-    /// button label so the user sees a realistic number, not a misleading one.
-    private func deletableExtrasCount(_ groups: [(name: String, items: [FontItem])]) -> Int {
-        var n = 0
-        for group in groups {
-            let keeper = winner(in: group.items)
-            for item in group.items where item.id != keeper.id {
-                if !SystemFontGuard.isProtected(item) { n += 1 }
-            }
-        }
-        return n
-    }
-
-    private func allExtrasCount(_ groups: [(name: String, items: [FontItem])]) -> Int {
-        groups.reduce(0) { $0 + max(0, $1.items.count - 1) }
-    }
-
-    private func totalExtras() -> Int {
-        allExtrasCount(lib.duplicateGroups)
-    }
-
-    private func performBatchDelete(_ items: [FontItem]) async {
-        var deleted = 0
-        var errors: [String] = []
-        for item in items {
-            do {
-                try await lib.deleteFontFile(item)
-                deleted += 1
-            } catch {
-                errors.append("\(item.fileURL.lastPathComponent): \(error.localizedDescription)")
-            }
-        }
-        selection.removeAll()
-        lastDeleteReport = "Moved \(deleted) file\(deleted == 1 ? "" : "s") to Trash."
-        if !errors.isEmpty {
-            deleteError = errors.joined(separator: "\n")
-        }
+        .listStyle(.plain)
     }
 }
 
-/// Environment passthrough so every row can mutate the same selection set
-/// without each taking a binding as a parameter.
-private struct DuplicatesSelectionKey: EnvironmentKey {
-    static let defaultValue: Binding<Set<String>> = .constant([])
-}
-extension EnvironmentValues {
-    var duplicatesSelection: Binding<Set<String>> {
-        get { self[DuplicatesSelectionKey.self] }
-        set { self[DuplicatesSelectionKey.self] = newValue }
-    }
-}
-
-/// One duplicate group — the PS-name header plus every file claiming that name.
 private struct DuplicateGroupRow: View {
     @EnvironmentObject var lib: FontLibrary
-    let group: (name: String, items: [FontItem])
-    let winner: FontItem
-    @Binding var selection: Set<String>
+    let group: DuplicateScanner.Group
+    let keeper: URL
+    let included: Bool
+    let setKeeper: (URL) -> Void
+    let toggleIncluded: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Group header
             HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                Text(group.name)
-                    .font(.system(.body, design: .monospaced).weight(.medium))
-                    .textSelection(.enabled)
-                Text("\(group.items.count) files")
+                Toggle("", isOn: Binding(get: { included }, set: { _ in toggleIncluded() }))
+                    .labelsHidden().toggleStyle(.checkbox)
+                Text("\(group.paths.count) identical copies")
+                    .font(.system(size: 12, weight: .medium))
+                Text(ByteCountFormatter.string(fromByteCount: group.size, countStyle: .file))
                     .font(.caption).foregroundStyle(.secondary)
+                Text("frees " + ByteCountFormatter.string(
+                        fromByteCount: group.size * Int64(group.paths.count - 1), countStyle: .file))
+                    .font(.caption2)
                     .padding(.horizontal, 6).padding(.vertical, 1)
-                    .background(Color.orange.opacity(0.15), in: Capsule())
+                    .background(Color.green.opacity(0.15), in: Capsule())
+                    .foregroundStyle(.green)
                 Spacer()
             }
-            .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 6)
+            .padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 4)
 
-            // Files
-            ForEach(group.items) { item in
-                DuplicateFileRow(item: item,
-                                 isWinner: item.id == winner.id,
-                                 selection: $selection)
+            ForEach(group.paths, id: \.self) { url in
+                fileRow(url)
             }
         }
         .padding(.bottom, 8)
+        .opacity(included ? 1 : 0.45)
     }
-}
 
-/// One file row within a duplicate group — checkbox, path, metadata, actions.
-private struct DuplicateFileRow: View {
-    @EnvironmentObject var lib: FontLibrary
-    @EnvironmentObject var sel: SelectionModel
-    let item: FontItem
-    let isWinner: Bool
-    @Binding var selection: Set<String>
-
-    var body: some View {
-        let protectionReason = SystemFontGuard.protectionReason(for: item)
-        let isProtected = protectionReason != nil
-        let location = SystemFontGuard.location(of: item.fileURL)
-
-        HStack(alignment: .center, spacing: 10) {
-            // Checkbox — disabled for protected files so a stray click can't
-            // queue Apple Color Emoji or SF Pro for deletion.
-            Toggle("", isOn: Binding(
-                get: { selection.contains(item.id) },
-                set: { on in
-                    if isProtected { return }
-                    if on { selection.insert(item.id) }
-                    else  { selection.remove(item.id) }
-                }
-            ))
-            .labelsHidden()
-            .toggleStyle(.checkbox)
-            .disabled(isProtected)
-            .help(isProtected ? (protectionReason ?? "Protected") : "Queue for deletion")
-
-            // Winner crown OR active dot
-            if isWinner {
-                Image(systemName: "crown.fill")
-                    .foregroundStyle(.yellow)
-                    .help("Keep — picked by current strategy")
-            } else {
-                Circle()
-                    .fill(lib.isActive(item) ? Color.green : Color.secondary.opacity(0.3))
-                    .frame(width: 8, height: 8)
-            }
-
+    @ViewBuilder
+    private func fileRow(_ url: URL) -> some View {
+        let isKeeper = url == keeper
+        let faces = lib.itemsAtPath(url)
+        let isProtected = faces.contains { SystemFontGuard.isProtected($0) }
+        HStack(spacing: 10) {
+            Image(systemName: isKeeper ? "crown.fill" : "trash")
+                .foregroundStyle(isKeeper ? Color.yellow : Color.red.opacity(0.7))
+                .frame(width: 16)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(item.fileURL.lastPathComponent)
-                        .font(.system(.body, design: .default).weight(.medium))
+                    Text(url.lastPathComponent).font(.system(size: 12, weight: .medium))
                         .lineLimit(1)
-                    if lib.favorites.contains(item.id) {
-                        Image(systemName: "star.fill")
-                            .foregroundStyle(.yellow).font(.caption)
+                    if faces.count > 1 {
+                        Text("\(faces.count) faces").font(.caption2)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.blue.opacity(0.15), in: Capsule())
                     }
-                    locationBadge(for: location)
+                    if FontLibrary.isCloudSynced(url) {
+                        Label("Cloud", systemImage: "cloud")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
                     if isProtected {
-                        protectedBadge(reason: protectionReason ?? "")
+                        Label("Protected", systemImage: "lock.fill")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
-                Text(item.fileURL.deletingLastPathComponent().path)
+                Text(url.deletingLastPathComponent().path)
                     .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                HStack(spacing: 10) {
-                    Label(item.familyName + " · " + item.styleName, systemImage: "textformat")
-                        .font(.caption2).foregroundStyle(.secondary)
-                    Label(ByteCountFormatter.string(fromByteCount: item.fileSize, countStyle: .file),
-                          systemImage: "internaldrive")
-                        .font(.caption2).foregroundStyle(.secondary)
-                    Label(item.foundry, systemImage: "building.2")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
+                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
-
             Spacer()
-
-            Button {
-                NSWorkspace.shared.activateFileViewerSelecting([item.fileURL])
-            } label: { Image(systemName: "magnifyingglass") }
-            .buttonStyle(.borderless)
-            .help("Reveal in Finder")
-        }
-        .padding(.horizontal, 16).padding(.vertical, 8)
-        .background(
-            isWinner
-                ? Color.yellow.opacity(0.06)
-                : (selection.contains(item.id) ? Color.red.opacity(0.08) : Color.clear)
-        )
-        .contentShape(Rectangle())
-        .onTapGesture { sel.select(item.id) }
-    }
-
-    @ViewBuilder
-    private func locationBadge(for loc: SystemFontGuard.Location) -> some View {
-        let (text, color): (String, Color) = {
-            switch loc {
-            case .systemProtected: return ("/System", .red)
-            case .systemShared:    return ("/Library", .orange)
-            case .userFonts:       return ("~/Library", .blue)
-            case .userCustom:      return ("Custom", .purple)
+            if !isKeeper {
+                Button("Keep this one") { setKeeper(url) }
+                    .font(.caption)
             }
-        }()
-        Text(text)
-            .font(.system(size: 10, weight: .medium, design: .monospaced))
-            .padding(.horizontal, 5).padding(.vertical, 1)
-            .background(color.opacity(0.18), in: Capsule())
-            .foregroundStyle(color)
-    }
-
-    @ViewBuilder
-    private func protectedBadge(reason: String) -> some View {
-        HStack(spacing: 3) {
-            Image(systemName: "lock.fill")
-            Text("Protected")
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } label: { Image(systemName: "magnifyingglass") }
+                .buttonStyle(.borderless)
         }
-        .font(.system(size: 10, weight: .semibold))
-        .padding(.horizontal, 5).padding(.vertical, 1)
-        .background(Color.gray.opacity(0.2), in: Capsule())
-        .foregroundStyle(.secondary)
-        .help(reason)
+        .padding(.horizontal, 16).padding(.vertical, 5)
+        .background(isKeeper ? Color.yellow.opacity(0.07) : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture { setKeeper(url) }
     }
 }

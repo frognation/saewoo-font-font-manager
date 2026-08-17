@@ -20,6 +20,95 @@ final class Flag {
     var value = false
 }
 
+/// `SaewooFont --scan-duplicates` — read-only audit of the identical-file
+/// cleanup. Runs the exact scan the UI runs, then reports what *would* be
+/// deleted and audits the result for anything unsafe. Deletes nothing.
+/// Carries the scan result back across the semaphore.
+final class ResultBox: @unchecked Sendable {
+    var groups: [DuplicateScanner.Group] = []
+}
+
+enum DuplicateAuditCLI {
+    static func requested() -> Bool { CommandLine.arguments.contains("--scan-duplicates") }
+
+    @MainActor
+    static func run() async {
+        setvbuf(stdout, nil, _IONBF, 0)   // unbuffered: this runs piped
+        Persistence.readOnly = true      // audit must never mutate user state
+        print("\n=== Identical-file audit (read-only, deletes nothing) ===\n")
+        print("[1] bootstrapping…")
+
+        let lib = FontLibrary()
+        await lib.bootstrap()
+        print("[2] library: \(lib.items.count) faces")
+
+        // Snapshot what the audit needs, then leave the main actor entirely.
+        //
+        // The scan must NOT be awaited from here. `SaewooFontApp.init()` drives
+        // these CLI paths by spinning `RunLoop.main.run(until:)`, and that tight
+        // loop starves Swift's cooperative pool: measured on this library, the
+        // task group made no progress at all while the pump burned one core for
+        // ten minutes. Blocking the main thread on a semaphore instead lets the
+        // pool run normally.
+        let files = lib.uniqueFilesForAudit
+
+        print("[3] scanning \(files.count) files…")
+        let started = Date()
+        let groups = await DuplicateScanner.scan(files: files) { p in
+            if p.done == p.total { FileHandle.standardError.write(Data(".".utf8)) }
+        }
+        print(String(format: "\nscan took %.1fs\n", Date().timeIntervalSince(started)))
+
+        let extras = groups.reduce(0) { $0 + $1.paths.count - 1 }
+        let bytes = groups.reduce(Int64(0)) { $0 + $1.size * Int64($1.paths.count - 1) }
+        print("identical groups     : \(groups.count)")
+        print("removable copies     : \(extras)")
+        print("reclaimable          : \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))")
+
+        // --- safety audit -------------------------------------------------
+        func sortKey(_ f: FontItem) -> String {
+            "\(f.styleName)\u{1}\(f.familyName)\u{1}\(f.postScriptName)"
+        }
+        var noKeeper = 0, protectedDeleted = 0, cloudDeleted = 0
+        var facesLost = 0, facesPreserved = 0, pairedByOrder = 0, multiFaceFiles = 0
+        for g in groups {
+            let keeper = lib.recommendedKeeper(in: g)
+            guard g.paths.contains(keeper) else { noKeeper += 1; continue }
+            let keeperFaces = lib.itemsAtPath(keeper).sorted { sortKey($0) < sortKey($1) }
+            let keeperPS = Set(keeperFaces.map { $0.postScriptName })
+            for victim in g.paths where victim != keeper {
+                let faces = lib.itemsAtPath(victim).sorted { sortKey($0) < sortKey($1) }
+                if faces.count > 1 { multiFaceFiles += 1 }
+                if faces.contains(where: { SystemFontGuard.isProtected($0) }) { protectedDeleted += 1 }
+                if FontLibrary.isCloudSynced(victim) { cloudDeleted += 1 }
+                for f in faces {
+                    if keeperPS.contains(f.postScriptName) {
+                        facesPreserved += 1
+                    } else if faces.count == keeperFaces.count {
+                        pairedByOrder += 1; facesPreserved += 1
+                    } else {
+                        facesLost += 1
+                    }
+                }
+            }
+        }
+        print("\n--- safety audit ---")
+        print("groups with no valid keeper            : \(noKeeper)      (must be 0)")
+        print("faces whose twin survives in the keeper: \(facesPreserved)")
+        print("faces paired by position (unnamed fonts): \(pairedByOrder)")
+        print("faces with NO twin in the keeper       : \(facesLost)      (must be 0)")
+        print("multi-face files among deletions       : \(multiFaceFiles)  (safe: identical copy kept)")
+        print("protected/system files among deletions : \(protectedDeleted)  (skipped at delete time)")
+        print("cloud-synced files among deletions     : \(cloudDeleted)  (flagged in UI)")
+
+        let ok = noKeeper == 0 && facesLost == 0
+        let verdict = ok
+            ? "SAFE — every removed face exists byte-identically in a kept file"
+            : "UNSAFE — do not ship this"
+        print("\nVERDICT: \(verdict)\n")
+    }
+}
+
 enum RightFontImportCLI {
 
     static func requestedArguments() -> (bundle: URL, map: URL)? {

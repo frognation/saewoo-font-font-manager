@@ -168,7 +168,10 @@ struct SidebarView: View {
                      title: ToolKind.duplicates.label,
                      icon: ToolKind.duplicates.icon,
                      tint: ToolKind.duplicates.tint,
-                     count: lib.duplicateGroups.count > 0 ? lib.duplicateGroups.count : nil)
+                     // Content-identical groups, not PostScript-name collisions.
+                     // The old badge showed 21 949 "duplicates" that were mostly
+                     // different fonts sharing a name; it invited a destructive click.
+                     count: lib.contentDuplicates.isEmpty ? nil : lib.contentDuplicates.count)
             rowLabel(.tool(.organize),
                      title: ToolKind.organize.label,
                      icon: ToolKind.organize.icon,

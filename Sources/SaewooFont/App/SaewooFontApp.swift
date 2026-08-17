@@ -21,6 +21,15 @@ struct SaewooFontApp: App {
             MainActor.assumeIsolated { Benchmark.run() }
             exit(0)
         }
+        if DuplicateAuditCLI.requested() {
+            let done = Flag()
+            Task { @MainActor in
+                await DuplicateAuditCLI.run()
+                done.value = true
+            }
+            while !done.value { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+            exit(0)
+        }
         // Headless RightFont import — see RightFontImportCLI.
         if let args = RightFontImportCLI.requestedArguments() {
             // Pump the run loop rather than blocking on a semaphore: the work

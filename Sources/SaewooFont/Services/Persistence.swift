@@ -51,6 +51,24 @@ enum Persistence {
         }
     }
 
+    /// Records what a duplicate purge removed and which identical copy it kept.
+    ///
+    /// The deleted files are byte-identical to a survivor, so the *content* is
+    /// never actually gone — but the paths are, and something outside this app
+    /// may point at them. The manifest makes that recoverable and auditable.
+    @discardableResult
+    static func writeDeletionManifest(_ entries: [[String: String]]) -> URL? {
+        guard !entries.isEmpty, !readOnly else { return nil }
+        let dir = appFolder.appendingPathComponent("DeletionManifests", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("deleted-\(Int(Date().timeIntervalSince1970)).json")
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? enc.encode(entries) else { return nil }
+        try? data.write(to: url, options: .atomic)
+        return url
+    }
+
     /// Most recent backups, newest first — for a future "restore" UI.
     static func stateBackups() -> [URL] {
         let fm = FileManager.default

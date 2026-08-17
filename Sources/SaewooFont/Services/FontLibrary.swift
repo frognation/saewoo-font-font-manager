@@ -36,6 +36,7 @@ final class FontLibrary: ObservableObject {
         foundryBucketsCache = nil
         displayableSourcesCache = nil
         searchIndexCache = nil
+        facesByPathCache = nil
         invalidateDerivedViews()
     }
 
@@ -1093,6 +1094,198 @@ final class FontLibrary: ObservableObject {
         scheduleCacheSave()
     }
 
+    // MARK: - Content-identical duplicates
+
+    @Published private(set) var contentDuplicates: [DuplicateScanner.Group] = []
+    @Published private(set) var duplicateScanProgress: DuplicateScanner.Progress?
+    @Published private(set) var isScanningDuplicates = false
+
+    /// Snapshot for the `--scan-duplicates` audit, which must hand the file
+    /// list off the main actor before scanning.
+    var uniqueFilesForAudit: [(url: URL, size: Int64)] { uniqueFiles }
+
+    /// Distinct files in the library, with their sizes.
+    private var uniqueFiles: [(url: URL, size: Int64)] {
+        var seen = Set<String>()
+        var out: [(URL, Int64)] = []
+        for item in items where seen.insert(item.fileURL.path).inserted {
+            out.append((item.fileURL, item.fileSize))
+        }
+        return out
+    }
+
+    func scanContentDuplicates() async {
+        guard !isScanningDuplicates else { return }
+        isScanningDuplicates = true
+        duplicateScanProgress = nil
+        let files = uniqueFiles
+        let groups = await DuplicateScanner.scan(files: files) { [weak self] p in
+            Task { @MainActor in self?.duplicateScanProgress = p }
+        }
+        contentDuplicates = groups
+        duplicateScanProgress = nil
+        isScanningDuplicates = false
+    }
+
+    /// Which copy to keep, in descending order of "the user would miss this".
+    ///
+    /// Because every copy is byte-identical, this only decides *where* the
+    /// surviving file lives — never what the user ends up with.
+    func recommendedKeeper(in group: DuplicateScanner.Group) -> URL {
+        let scored = group.paths.map { url -> (URL, Int) in
+            var score = 0
+            let faces = itemsAtPath(url)
+            // Never delete something the guard considers untouchable.
+            if faces.contains(where: { SystemFontGuard.isProtected($0) }) { score += 1000 }
+            if faces.contains(where: { favorites.contains($0.id) })       { score += 100 }
+            if faces.contains(where: { activeFontIDs.contains($0.id) })   { score += 50 }
+            if faces.contains(where: { id in
+                collections.contains { $0.fontIDs.contains(id.id) }
+            }) { score += 40 }
+            // Prefer a stable local folder over a cloud-synced one.
+            if !Self.isCloudSynced(url) { score += 10 }
+            if SystemFontGuard.isInUserFolder(url) { score += 5 }
+            return (url, score)
+        }
+        return scored.max(by: { $0.1 < $1.1 })?.0 ?? group.paths[0]
+    }
+
+    /// path → the faces parsed out of that file, built once per library
+    /// version.
+    ///
+    /// `itemsAtPath` used to filter the whole library on every call. The
+    /// duplicates screen calls it per row, and the safety audit calls it once
+    /// per copy per group — at 23 644 groups over 106 950 faces that is about
+    /// 7 billion comparisons, which read exactly like a hang.
+    private var facesByPathCache: (Int, [String: [FontItem]])? = nil
+
+    private var facesByPath: [String: [FontItem]] {
+        if let c = facesByPathCache, c.0 == derivedVersion { return c.1 }
+        var map: [String: [FontItem]] = [:]
+        map.reserveCapacity(items.count)
+        for item in items { map[item.fileURL.path, default: []].append(item) }
+        facesByPathCache = (derivedVersion, map)
+        return map
+    }
+
+    func itemsAtPath(_ url: URL) -> [FontItem] {
+        facesByPath[url.path] ?? []
+    }
+
+    /// Dropbox / Google Drive / iCloud live under predictable roots. Deleting
+    /// there propagates to every synced machine, so it is worth surfacing.
+    static func isCloudSynced(_ url: URL) -> Bool {
+        let p = url.path
+        return p.contains("/CloudStorage/") || p.contains("/Dropbox")
+            || p.contains("/Library/Mobile Documents/")
+    }
+
+    struct DuplicateDeletionReport {
+        var filesDeleted = 0
+        var facesRemoved = 0
+        var bytesReclaimed: Int64 = 0
+        var referencesRemapped = 0
+        var skipped: [String] = []
+        var errors: [String] = []
+        var manifestURL: URL?
+    }
+
+    /// Deletes every copy except `keeper` in each group.
+    ///
+    /// Safe by construction:
+    /// - the API takes a group plus its keeper, so it is impossible to ask for
+    ///   "delete all copies";
+    /// - protected files (SIP / macOS essentials) are never deleted;
+    /// - favorites, projects and variable instances pointing at a deleted copy
+    ///   are re-pointed at the identical face in the keeper, so nothing the
+    ///   user curated is lost;
+    /// - a manifest records deleted → kept for every file.
+    func deleteDuplicates(_ decisions: [(group: DuplicateScanner.Group, keeper: URL)])
+        async -> DuplicateDeletionReport
+    {
+        var report = DuplicateDeletionReport()
+        var remap: [String: String] = [:]        // deleted FontItem.id -> kept id
+        var deletedPaths: [String] = []
+        var manifest: [[String: String]] = []
+
+        // Deterministic ordering used to pair faces between two identical
+        // files when their PostScript names don't match. That happens more
+        // than you'd expect: Core Text invents placeholder names like
+        // "font0000000030329341" for fonts with no usable name table, and the
+        // number differs per registration — so byte-identical files can report
+        // different PostScript names. 747 faces in the reference library hit
+        // this. Pairing by position rescues them; without it their favorites
+        // would silently dangle.
+        func sortKey(_ f: FontItem) -> String {
+            "\(f.styleName)\u{1}\(f.familyName)\u{1}\(f.postScriptName)"
+        }
+
+        for (group, keeper) in decisions {
+            let keeperFaces = itemsAtPath(keeper).sorted { sortKey($0) < sortKey($1) }
+            var keeperByPS: [String: String] = [:]
+            for f in keeperFaces { keeperByPS[f.postScriptName] = f.id }
+
+            for victim in group.paths where victim != keeper {
+                let faces = itemsAtPath(victim).sorted { sortKey($0) < sortKey($1) }
+                if faces.contains(where: { SystemFontGuard.isProtected($0) }) {
+                    report.skipped.append("\(victim.lastPathComponent) — protected system font")
+                    continue
+                }
+                do {
+                    try await activator.deactivate(faces)
+                } catch { /* deactivation is best-effort; the file still goes */ }
+                activeFontIDs.subtract(faces.map { $0.id })
+
+                do {
+                    try FileManager.default.trashItem(at: victim, resultingItemURL: nil)
+                } catch {
+                    report.errors.append("\(victim.lastPathComponent): \(error.localizedDescription)")
+                    continue
+                }
+                for (i, f) in faces.enumerated() {
+                    if let keptID = keeperByPS[f.postScriptName] {
+                        remap[f.id] = keptID
+                    } else if faces.count == keeperFaces.count {
+                        // Same file, same face count, unusable names — pair by
+                        // position. Safe because the bytes are identical.
+                        remap[f.id] = keeperFaces[i].id
+                    }
+                }
+                deletedPaths.append(victim.path)
+                manifest.append(["deleted": victim.path, "kept": keeper.path,
+                                 "sha256": group.digest, "size": String(group.size)])
+                report.filesDeleted += 1
+                report.facesRemoved += faces.count
+                report.bytesReclaimed += group.size
+            }
+        }
+
+        guard report.filesDeleted > 0 else { return report }
+
+        // Re-point curation at the surviving identical copy.
+        let before = favorites.count + collections.reduce(0) { $0 + $1.fontIDs.count }
+        favorites = Set(favorites.map { remap[$0] ?? $0 })
+        for i in collections.indices {
+            collections[i].fontIDs = Set(collections[i].fontIDs.map { remap[$0] ?? $0 })
+        }
+        for i in variableInstances.indices {
+            if let newID = remap[variableInstances[i].baseFontID] {
+                variableInstances[i].baseFontID = newID
+            }
+        }
+        report.referencesRemapped = remap.count
+        _ = before
+
+        let gone = Set(deletedPaths)
+        items.removeAll { gone.contains($0.fileURL.path) }
+        contentDuplicates.removeAll { g in g.paths.allSatisfy { gone.contains($0.path) } }
+        invalidateDerived()
+        persist()
+        scheduleCacheSave()
+        report.manifestURL = Persistence.writeDeletionManifest(manifest)
+        return report
+    }
+
     // MARK: - Bulk import helpers
 
     /// Creates one palette per entry, prefixed with the source library name so
@@ -1242,7 +1435,7 @@ enum ToolKind: String, Codable, Hashable, CaseIterable, Identifiable {
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .duplicates:  return "Find Duplicates"
+        case .duplicates:  return "Identical Files"
         case .organize:    return "Organize"
         case .proofSheet:  return "Proof Sheet"
         case .orphans:     return "Orphan Files"
