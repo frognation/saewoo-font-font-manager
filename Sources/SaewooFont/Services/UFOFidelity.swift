@@ -22,6 +22,8 @@ struct ForkFidelity {
 
     var kerningPairs = 0
     var kerningSource: KerningSource = .none
+    /// GPOS subtables we skipped (contextual, unknown types).
+    var gposUnsupportedSubtables = 0
 
     /// OpenType feature tags present in the font. We cannot regenerate
     /// `features.fea` from compiled GSUB/GPOS, so these are listed to be
@@ -33,8 +35,9 @@ struct ForkFidelity {
         case none
         /// Legacy `kern` table, format 0 — a flat pair list we can read.
         case kernTable
-        /// Modern GPOS. Class-based and context-sensitive; extracting it
-        /// properly means implementing a layout engine, so we don't pretend to.
+        /// Modern GPOS, and we managed to read pair positioning out of it.
+        case gpos
+        /// GPOS present but nothing extractable (contextual-only kerning).
         case gposOnly
     }
 
@@ -69,7 +72,14 @@ enum UFOFidelity {
             r.kerningPairs = pairs.count
             r.kerningSource = .kernTable
         } else if table(font, "GPOS") != nil {
-            r.kerningSource = .gposOnly
+            let g = GPOSKerning.read(font: font)
+            if g.pairs.isEmpty {
+                r.kerningSource = .gposOnly
+            } else {
+                r.kerningPairs = g.pairs.count
+                r.kerningSource = .gpos
+                r.gposUnsupportedSubtables = g.unsupportedSubtables
+            }
         }
 
         r.gsubFeatures = featureTags(font: font, table: "GSUB")

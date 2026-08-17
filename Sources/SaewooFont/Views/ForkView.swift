@@ -122,8 +122,10 @@ struct ForkView: View {
                 switch f.kerningSource {
                 case .kernTable:
                     fidelityRow("Kerning", "\(f.kerningPairs) pairs", ok: true)
+                case .gpos:
+                    fidelityRow("Kerning", "\(f.kerningPairs) pairs from GPOS", ok: true)
                 case .gposOnly:
-                    fidelityRow("Kerning", "in GPOS — not extractable, will be lost", ok: false)
+                    fidelityRow("Kerning", "in GPOS but contextual only — will be lost", ok: false)
                 case .none:
                     fidelityRow("Kerning", "none in this font", ok: true)
                 }

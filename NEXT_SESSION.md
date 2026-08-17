@@ -60,6 +60,11 @@ Saewoo Font macOS 폰트매니저 작업 이어가자. 모든 컨텍스트는 �
                            Services/SystemFontGuard.swift (중복 제거 안전장치),
                            Services/DuplicateScanner.swift (byte-identical 매칭)
 
+## 아침에 먼저 볼 것
+
+`SESSION-REPORT.md` — 2026-08-16/17 세션 전체 요약(성능·데이터 사고·중복 재설계·
+RightFont 정리·Fork 점검·분리 권고)이 한 파일에 정리돼 있음.
+
 ## 현재 상태 한 줄 요약
 
 네이티브 Swift + SwiftUI macOS 폰트매니저. macOS 13+, SPM 기반.
@@ -101,21 +106,20 @@ debug 빌드 수치는 의미 없음.
 
 ## 우선순위 (HANDOFF.md "Session 4" + "Queued for the next session" 종합)
 
-  0. **(최우선·진행 중) Fork 툴 UFO 산출물 fidelity.** `ab675a7`에서 `--fork`
-     CLI로 실제 출력을 검사해 확인된 갭:
-     - 657글리프 중 140개 누락 (GSUB 전용 glyph — alternate/ligature/small
-       caps — 는 `writeAllGlyphs`가 unicode→glyph 매핑만 따라가서 못 찾음)
-     - `kerning.plist` / `features.fea` / `groups.plist` / `lib.plist` 전부
-       미출력 → GPOS/GSUB 데이터 완전 소실
-     - 모든 glif에 `<component>` 없음 → composite가 flatten되어 accent가
-       base glyph를 못 따라감
-     - glyph 파일명 언더스코어 위치가 스펙과 다름 (`_Ccedilla.glif`,
-       스펙은 `C_cedilla.glif`) — contents.plist가 authoritative라 지금은
-       무해하지만 non-conforming
-     - designspace에 `<source>`만 있고 `<instance>`가 없음
-     **이 항목은 이번 세션에서 시작된 진행 중(in progress) 작업임** — 새 기능이
-     아니라 이어서 고치는 버그 목록으로 취급할 것. `Services/UFOExporter.swift`,
-     검증 기준은 `Services/ForkCLI.swift` 참고.
+  0. **(최우선·결정 필요) Fork를 별도 툴로 뺄지 결정.** `949b713`까지에서 글리프
+     누락(517→657/657)과 composite 구조 보존(TrueType 528개)은 해결됐고,
+     내보내기 전 손실 안내도 붙었음. 남은 갭은 GPOS 커닝 / `features.fea` /
+     CFF composite.
+     **그런데 결합도를 실측해보니 app↔Fork 접점이 단 2곳**이고(ContentView
+     라우팅 1줄, SaewooFontApp CLI 훅), 이 머신에 **fontTools 4.62.1이 이미
+     설치**돼 있음. GPOS 커닝 기준 Swift 수작업 ~300줄 vs fontTools 20줄로
+     47,017 페어/0.1초. `varLib.instancer`는 지금 포기한 "가변폰트 마스터
+     composite 보존"까지 정확히 해결함.
+     → **권고: Fork 분리 + 포맷 처리는 fontTools 위임.** 근거와 분리 방법은
+     `SESSION-REPORT.md` 7절 및 HANDOFF.md Session 4 §9 참고.
+     **결정 전까지 Fork에 추가 투자 보류할 것.** 분리하지 않기로 하면 현재
+     상태에서 멈추는 편이 나음 — 반쯤 구현된 커닝/피처는 "있는 줄 알았는데
+     없더라"가 되어 오히려 위험함.
   1. library-cache.json을 바이너리/스트리밍 포맷으로 교체.
      60MB JSON 디코드가 런치 피크 메모리 712MB와 1.2초 디코드의 원인.
      디코드 시간·피크 메모리·파일 크기를 한 번에 잡을 수 있는 항목.

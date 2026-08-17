@@ -124,6 +124,8 @@ enum UFOExporter {
             ])
         }
 
+        if options.glyphMode != .empty { _ = try writeKerning(to: ufo, font: font) }
+
         return Report(outputURL: ufo, unitsPerEm: upm,
                       glyphCount: glyphCount, mode: options.glyphMode)
     }
@@ -357,7 +359,58 @@ enum UFOExporter {
                            atomically: true, encoding: .utf8)
 
         _ = layerName  // (consumed by caller via writeLayerContents)
+        lastNameByGid = nameByGid
         return finalRecords.count
+    }
+
+    /// Glyph names from the most recent `writeAllGlyphs`, so `writeKerning`
+    /// can emit pairs by name. UFO kerning is keyed by glyph NAME, not index,
+    /// and the names are only final after deduplication.
+    private static var lastNameByGid: [Int: String] = [:]
+
+    /// Writes `kerning.plist` from whichever source has pairs — legacy `kern`
+    /// first, then GPOS. Skipped entirely when neither yields anything, since
+    /// an empty kerning.plist is just noise in the diff.
+    private static func writeKerning(to ufo: URL, font: CTFont) throws -> Int {
+        let names = lastNameByGid
+        guard !names.isEmpty else { return 0 }
+
+        var flat: [(CGGlyph, CGGlyph, Int)] = KernReader.read(font: font)
+            .map { ($0.left, $0.right, $0.value) }
+        if flat.isEmpty {
+            flat = GPOSKerning.read(font: font).pairs.map { ($0.left, $0.right, $0.value) }
+        }
+        guard !flat.isEmpty else { return 0 }
+
+        var grouped: [String: [(String, Int)]] = [:]
+        for (l, r, v) in flat {
+            guard v != 0,
+                  let ln = names[Int(l)], let rn = names[Int(r)] else { continue }
+            grouped[ln, default: []].append((rn, v))
+        }
+        guard !grouped.isEmpty else { return 0 }
+
+        var body = ""
+        var count = 0
+        for (first, seconds) in grouped.sorted(by: { $0.key < $1.key }) {
+            body += "\n  <key>\(xmlEscape(first))</key>\n  <dict>"
+            for (second, value) in seconds.sorted(by: { $0.0 < $1.0 }) {
+                body += "\n    <key>\(xmlEscape(second))</key>\n    <integer>\(value)</integer>"
+                count += 1
+            }
+            body += "\n  </dict>"
+        }
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>\(body)
+        </dict>
+        </plist>
+        """
+        try xml.write(to: ufo.appendingPathComponent("kerning.plist"),
+                      atomically: true, encoding: .utf8)
+        return count
     }
 
     private static func writeLayerContents(to ufo: URL, layers: [(String, String)]) throws {

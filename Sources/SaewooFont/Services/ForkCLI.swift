@@ -43,7 +43,8 @@ enum ForkCLI {
         switch fid.kerningSource {
         case .none:      print("  kerning       : none in font")
         case .kernTable: print("  kerning       : \(fid.kerningPairs) pairs from legacy kern table")
-        case .gposOnly:  print("  kerning       : GPOS only — NOT extractable")
+        case .gpos:      print("  kerning       : \(fid.kerningPairs) pairs from GPOS (\(fid.gposUnsupportedSubtables) subtables skipped)")
+        case .gposOnly:  print("  kerning       : GPOS only — nothing extractable")
         }
         print("  GSUB features : \(fid.gsubFeatures.isEmpty ? "none" : fid.gsubFeatures.joined(separator: " "))")
         print("  GPOS features : \(fid.gposFeatures.isEmpty ? "none" : fid.gposFeatures.joined(separator: " "))")

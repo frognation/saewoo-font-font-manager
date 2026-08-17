@@ -10,7 +10,7 @@ future sessions can start from `main` unless the user asks for a feature branch.
 
 ---
 
-## Session 4 — 2026-08-16 · commits `25d3efc..ab675a7`
+## Session 4 — 2026-08-16/17 · commits `25d3efc..949b713`
 
 Triggered by "무겁고 느린 게 젤 큰 문제". Started as a performance pass, then
 widened into persistence safety, a RightFont library migration, a
@@ -301,6 +301,69 @@ see `NEXT_SESSION.md`:
   asks for one after each uppercase character (`C_cedilla.glif`). Harmless
   while `contents.plist` is authoritative, but not conforming.
 - The designspace has `<source>` elements but no `<instance>` elements.
+
+### 8. Fork fidelity — every glyph, composites preserved (`cf9159c`, `949b713`)
+
+`writeAllGlyphs` walked the character set and mapped unicode → glyph, so
+anything reachable only through GSUB never exported: alternates, ligatures,
+small caps. 517 of 657 on the reference variable font. The unicode walk now
+only collects scalar coverage; the export loop iterates glyph indices
+`0..<CTFontGetGlyphCount`. Verified 657/657 and 11 972/11 972.
+
+`CTFontCreatePathForGlyph` only returns flattened outlines, so every accented
+glyph exported as loose contours — 406 of 657 on that font, 528 of 11 972 on
+JetBrains Mono. `GlyfComponents` parses composite records out of `glyf`/`loca`
+and the exporter emits `<component base=…>`. `Umacron` now writes as `U` plus
+`uni0304.case` at xOffset 599.
+
+Scoped deliberately, and **do not widen these without reading why**:
+- TrueType only. CFF composites live in subroutines and `seac`.
+- **Not used for variable-font masters.** `gvar` moves component offsets per
+  instance and the reader only sees the default `glyf`, so reusing those
+  offsets misplaces every accent in every non-default master.
+- Point-matched components (`ARGS_ARE_XY_VALUES` clear) fall back to
+  flattening rather than being placed wrongly.
+
+`UFOFidelity` inspects a font without writing and reports glyph coverage,
+composite handling, kerning source and the GSUB/GPOS feature tags present.
+`ForkView` shows it above the options, green when nothing is lost, amber when
+something is. Still missing: GPOS kerning, `features.fea`, CFF composites.
+
+### 9. Should Fork be a separate tool? — yes, and rebased on fontTools
+
+Measured coupling, because the answer turns on it:
+
+| direction | surface |
+|---|---|
+| app → Fork | **2 places**: `ContentView` routing line, `SaewooFontApp` CLI hook |
+| Fork → app | `FontItem` (data only), plus `FontLibrary`/`SelectionModel` in `ForkView` for resolving the selection |
+
+1 853 lines of Fork code touch the rest of the app essentially twice.
+`UFOExporter` genuinely needs a file path, a few names and the variation axes;
+the other `FontItem` fields are only touched because it clones the struct.
+**Splitting costs almost nothing.**
+
+The bigger finding: this machine already has **fontTools 4.62.1** with
+`feaLib`, `varLib.instancer` and `ufoLib2`. Measured against the hand-rolled
+Swift path:
+
+| | Swift here | fontTools |
+|---|---|---|
+| GPOS kerning | ~300 lines of binary parsing | **47 017 pairs, 0.1 s, ~20 lines** |
+| composites | TrueType only, no variable masters | all formats, `addComponent` built in |
+| `features.fea` | needs a decompiler | `feaLib` |
+| variable masters | `gvar` not applied → flattened | `varLib.instancer` applies it correctly |
+| UFO conformance | hand-assembled XML | `ufoLib2` |
+
+`varLib.instancer` in particular solves the exact limitation we just accepted.
+Continuing in Swift means shipping an inferior reimplementation of something
+mature.
+
+Recommendation: **move Fork out, and let fontTools do the font-format work.**
+The font manager keeps at most a "send selection to Fork" affordance (a file
+path is all that crosses). If it is NOT split, stop at the current state —
+half-implemented kerning/features are worse than none, because the gap is only
+discovered after redrawing has begun.
 
 ### CLI entry points
 
