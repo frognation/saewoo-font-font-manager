@@ -10,6 +10,82 @@ future sessions can start from `main` unless the user asks for a feature branch.
 
 ---
 
+## Session 5 — 2026-08-17/18 · commits `ead0a19..8acb123`
+
+Applied the previous session's tools to the real library, split Fork out, and
+fixed what only showed up under real load.
+
+| Commit | Summary |
+|--------|---------|
+| `ead0a19` | feat(fork): extract GPOS kerning into kerning.plist |
+| `45a19c9` | refactor: split Fork out into the Type Forker repository |
+| `ef33165` | feat(duplicates): global keep-priority policy with a live preview |
+| `d22fe37` | perf(duplicates): stop the keep-priority panel freezing on every change |
+| `4aa8a36` | fix(duplicates): purge was rendering the whole list once per deleted file |
+| `2061bc6` | fix(organize): preview list drew on top of the controls; add folder presets |
+| `e08af6c` | fix(organize): move files, not faces; add confirm, progress and a report |
+| `8acb123` | polish(duplicates): English UI strings, and one consistent file count |
+
+### Outcome on the real library
+
+```
+macOS-visible fonts   12,578 -> 3,570   (-72%)
+~/Library/Fonts        6,904 ->   307
+reclaimed              2.92 GB across 41,894 files
+data lost              none — all 41,894 manifest entries verified
+```
+
+### The same mistake, three more times
+
+Every performance failure this session was the same shape: **expensive work
+reachable from a SwiftUI `body`, or `@Published` state mutated in a loop.**
+
+1. **Purge**: `activeFontIDs.subtract()` inside the delete loop. `activeFontIDs`
+   is `@Published`, so each file re-rendered all 14 observing views, and
+   `DuplicatesView` re-picked a keeper for all 23,644 groups. 27 minutes for
+   147 files. Measured `trashItem` at 3 ms local / 9 ms in Dropbox — the file
+   I/O was never the problem. Fixed: collect locally, apply once, and show a
+   progress view *instead of* the list. Under 2 minutes.
+2. **Policy panel**: the preview was a computed property called from `body`,
+   which SwiftUI reads several times per pass, each walking every group.
+   3,000 ms -> 736 ms, then moved off the main actor.
+3. **Organize**: moved per *face* rather than per *file*. A variable font is
+   one file with many faces, so it tried to move the same file nine times —
+   one success, eight "already exists" errors.
+
+**If something feels frozen, look for published state or an O(n) walk inside a
+view body before suspecting I/O.**
+
+### Keep-priority policy (`ef33165`)
+
+Per-group clicking doesn't scale to 23,644 groups, so which copy survives is
+now an ordered rule list (folder / cloud / local / curated / newest …) with a
+live preview of files deleted, bytes reclaimed, and where deletions and
+survivors land.
+
+**A design assumption was corrected here.** The first version warned that
+keeping the cloud copy was risky. That conflated durability with availability:
+a fully-synced Dropbox folder is replicated to the cloud and to other machines,
+so it is *more* durable than one local disk. The real hazard is a copy that
+can't be read *now* — an unmounted volume or a placeholder with a path and no
+bytes. `isReachable` tests allocated blocks against logical size; sampling 300
+of 61,687 Dropbox fonts found zero placeholders.
+
+### Fork is gone from this repo (`45a19c9`)
+
+Moved to `~/Documents/GitHub/Projects/type-forker`
+(github.com/frognation/type-forker). Coupling was two lines. Tools keeps a
+`Fork → Type Forker` launcher. Before that, GPOS kerning extraction landed and
+was verified against fontTools: 47,017 pairs from both, exactly.
+
+### Known issues
+
+- The `NSTableView` reentrancy warning from Session 4 is still present.
+- `moveFontFile` (single-file) is still used by nothing but remains in the API
+  alongside the batched `moveFontFiles`; collapse them when convenient.
+
+---
+
 ## Session 4 — 2026-08-16/17 · commits `25d3efc..949b713`
 
 Triggered by "무겁고 느린 게 젤 큰 문제". Started as a performance pass, then
@@ -797,6 +873,15 @@ Sources/SaewooFont/
 ```
 
 ### Critical invariants
+
+- **Never mutate `@Published` state inside a bulk loop, and never do O(n) work
+  in a SwiftUI `body`.** Three separate features shipped broken this way
+  (duplicate purge, policy panel, Organize move) and every one presented as a
+  hang rather than as slowness. Collect locally, apply once, and swap the heavy
+  list out for a progress view while a long operation runs.
+- **File operations are per FILE, never per face.** A variable font is one file
+  exposing many `FontItem`s. Anything that deletes, moves or trashes must
+  deduplicate by `fileURL.path` first.
 - **FontItem.id** = `SHA.short("\(fileURL.path)::\(postScriptName)")`. Moving a
   file changes its ID — `moveFontFile` preserves the old ID by replacing the
   stored `FontItem` in place instead of regenerating. That is not sufficient on
