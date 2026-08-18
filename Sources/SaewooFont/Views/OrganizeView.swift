@@ -91,13 +91,16 @@ struct OrganizeView: View {
             Divider()
             modeSwitcher
             Divider()
+            // Controls and preview are separate scroll regions. Previously the
+            // preview's LazyVStack lived inside this ScrollView with only a
+            // `.frame(maxHeight:)`, which caps the frame but not the content —
+            // all 1 700+ rows still laid out and drew straight over the
+            // controls above them.
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     folderPickers
                     Divider()
                     if mode == .move { moveFilters } else { sortControls }
-                    Divider()
-                    previewList
                     if let err = lastError {
                         banner(err, color: .red, icon: "exclamationmark.triangle.fill")
                     }
@@ -107,6 +110,10 @@ struct OrganizeView: View {
                 }
                 .padding(16)
             }
+            .frame(maxHeight: 300)
+            Divider()
+            previewList
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             Divider()
             actionBar
         }
@@ -170,8 +177,32 @@ struct OrganizeView: View {
     private func folderPickerBox(_ label: String, url: Binding<URL?>, placeholder: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(label).font(.caption).foregroundStyle(.secondary)
-            Button {
-                pickFolder(assignTo: url)
+            Menu {
+                Section("Font folders") {
+                    ForEach(presetFolders) { preset in
+                        Button {
+                            url.wrappedValue = preset.url
+                            refreshSelection()
+                        } label: {
+                            Text(preset.count > 0
+                                 ? "\(preset.name)  —  \(preset.count) fonts"
+                                 : preset.name)
+                        }
+                        .disabled(preset.isProtected)
+                    }
+                }
+                if !lib.customScanPaths.isEmpty {
+                    Section("Your sources") {
+                        ForEach(lib.customScanPaths, id: \.self) { u in
+                            Button(u.lastPathComponent) {
+                                url.wrappedValue = u
+                                refreshSelection()
+                            }
+                        }
+                    }
+                }
+                Divider()
+                Button("Choose Folder…") { pickFolder(assignTo: url) }
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: "folder")
@@ -197,7 +228,37 @@ struct OrganizeView: View {
                 .overlay(RoundedRectangle(cornerRadius: 6)
                     .stroke(Color.secondary.opacity(0.2), lineWidth: 1))
             }
-            .buttonStyle(.plain)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+        }
+    }
+
+    /// One entry in the folder menu.
+    private struct FolderPreset: Identifiable {
+        let id: String
+        let name: String
+        let url: URL
+        let count: Int
+        let isProtected: Bool
+    }
+
+    /// The three folders macOS actually uses, offered directly so nobody has to
+    /// know `~/Library` is hidden and reach for Cmd-Shift-G.
+    /// `/System/Library/Fonts` is listed but disabled — SIP blocks moves there,
+    /// and omitting it entirely just leaves people wondering where it went.
+    private var presetFolders: [FolderPreset] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let specs: [(String, URL, Bool)] = [
+            ("User Fonts  (~/Library/Fonts)",
+             home.appendingPathComponent("Library/Fonts"), false),
+            ("Shared Fonts  (/Library/Fonts)",
+             URL(fileURLWithPath: "/Library/Fonts"), false),
+            ("System Fonts  (protected — cannot be moved)",
+             URL(fileURLWithPath: "/System/Library/Fonts"), true),
+        ]
+        return specs.map { name, url, prot in
+            FolderPreset(id: url.path, name: name, url: url,
+                         count: lib.itemCountInSource(url), isProtected: prot)
         }
     }
 
@@ -303,14 +364,17 @@ struct OrganizeView: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .padding(.vertical, 24).frame(maxWidth: .infinity)
             } else {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(preview) { item in
-                        previewRow(item)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(preview) { item in
+                            previewRow(item)
+                        }
                     }
                 }
-                .frame(maxHeight: 320)
+                .clipped()
             }
         }
+        .padding(.horizontal, 16).padding(.top, 10)
     }
 
     @ViewBuilder
