@@ -84,11 +84,16 @@ struct OrganizeView: View {
     @State private var running: Bool = false
     @State private var lastReport: String? = nil
     @State private var lastError: String? = nil
+    @State private var confirming = false
+    @State private var moveReport: FontLibrary.MoveReport?
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
+            if let p = lib.moveProgress {
+                moving(p)
+            } else {
             modeSwitcher
             Divider()
             // Controls and preview are separate scroll regions. Previously the
@@ -116,7 +121,76 @@ struct OrganizeView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             Divider()
             actionBar
+            }
         }
+        .confirmationDialog(confirmTitle, isPresented: $confirming) {
+            Button("Move Files", role: .destructive) { Task { await execute() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(confirmMessage)
+        }
+        .alert("Move finished", isPresented: Binding(
+            get: { moveReport != nil }, set: { if !$0 { moveReport = nil } })
+        ) {
+            Button("OK") { moveReport = nil }
+        } message: {
+            if let r = moveReport { Text(reportMessage(r)) }
+        }
+    }
+
+    /// Distinct files behind the selection — a variable font is one file with
+    /// many faces, and it is files that get moved.
+    private var selectedFileCount: Int {
+        Set(filteredItems().filter { selectedIDs.contains($0.id) }
+            .map { $0.fileURL.path }).count
+    }
+
+    private var confirmTitle: String {
+        "Move \(selectedFileCount) file\(selectedFileCount == 1 ? "" : "s")?"
+    }
+
+    private var confirmMessage: String {
+        let faces = selectedIDs.count
+        var m = "\(selectedFileCount) files (\(faces) faces) will be moved to\n"
+        m += (destURL?.path ?? "—") + "\n\n"
+        m += "Files are moved, not deleted. As long as the destination is inside a "
+        m += "scanned source they stay in your library and can be activated again.\n\n"
+        m += "If a file with the same name is already there, the incoming one is kept "
+        m += "alongside it with a number suffix — nothing is overwritten."
+        return m
+    }
+
+    private func reportMessage(_ r: FontLibrary.MoveReport) -> String {
+        var m = "\(r.filesMoved) files moved · \(r.facesUpdated) faces re-linked."
+        if r.renamed > 0 { m += "\n\(r.renamed) renamed to avoid a name clash." }
+        if !r.skipped.isEmpty {
+            m += "\n\nSkipped \(r.skipped.count):\n" + r.skipped.prefix(5).joined(separator: "\n")
+        }
+        if !r.errors.isEmpty {
+            m += "\n\nFailed \(r.errors.count):\n" + r.errors.prefix(5).joined(separator: "\n")
+        }
+        return m
+    }
+
+    /// Shown instead of the page while a move runs, so the preview rows aren't
+    /// being laid out on every progress tick.
+    @ViewBuilder
+    private func moving(_ p: FontLibrary.MoveProgress) -> some View {
+        VStack(spacing: 14) {
+            ProgressView(value: Double(p.done), total: Double(max(p.total, 1)))
+                .frame(width: 380)
+            Text("\(p.done) / \(p.total) files moved").font(.title3).monospacedDigit()
+            if !p.currentFile.isEmpty {
+                Text(p.currentFile)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: 420)
+            }
+            Button("Stop", role: .destructive) { lib.requestCancelMove() }
+            Text("Stopping is safe — files already moved stay where they are.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - Header
@@ -438,7 +512,7 @@ struct OrganizeView: View {
             }
             Spacer()
             Button {
-                Task { await execute() }
+                confirming = true
             } label: {
                 Label(mode == .move
                       ? "Move \(selectedIDs.count) to Destination"
@@ -532,38 +606,17 @@ struct OrganizeView: View {
 
         let toMove = filteredItems().filter { selectedIDs.contains($0.id) }
         guard let dest = destURL else { return }
+        let sorting = (mode == .sort)
 
-        var moved = 0
-        var errors: [String] = []
-
-        for item in toMove {
-            let target: URL
-            if mode == .sort {
-                let sub = dest.appendingPathComponent(subfolderFor(item), isDirectory: true)
-                do {
-                    try FileManager.default.createDirectory(
-                        at: sub, withIntermediateDirectories: true)
-                } catch {
-                    errors.append("Couldn't create \(sub.lastPathComponent): \(error.localizedDescription)")
-                    continue
-                }
-                target = sub
-            } else {
-                target = dest
-            }
-            do {
-                try await lib.moveFontFile(item, to: target)
-                moved += 1
-            } catch {
-                errors.append("\(item.fileURL.lastPathComponent): \(error.localizedDescription)")
-            }
+        // Destination is resolved per file; in sort mode that's a subfolder
+        // derived from the font itself.
+        let r = await lib.moveFontFiles(toMove) { item in
+            sorting ? dest.appendingPathComponent(subfolderFor(item), isDirectory: true)
+                    : dest
         }
 
         selectedIDs.removeAll()
-        lastReport = "Moved \(moved) file\(moved == 1 ? "" : "s")."
-        if !errors.isEmpty {
-            lastError = errors.joined(separator: "\n")
-        }
+        moveReport = r
     }
 
     private func pickFolder(assignTo url: Binding<URL?>) {

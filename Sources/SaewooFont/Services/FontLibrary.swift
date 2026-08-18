@@ -1065,6 +1065,127 @@ final class FontLibrary: ObservableObject {
     /// item record to point at the new URL and re-indexes favorites/collections
     /// by the (unchanged) FontItem.id.
     /// Throws on permission or collision errors.
+    /// Live move progress, mirroring the delete flow.
+    struct MoveProgress {
+        var done = 0
+        var total = 0
+        var currentFile = ""
+    }
+    @Published private(set) var moveProgress: MoveProgress?
+    private var cancelMove = false
+    func requestCancelMove() { cancelMove = true }
+
+    struct MoveReport {
+        var filesMoved = 0
+        var facesUpdated = 0
+        var renamed = 0
+        var skipped: [String] = []
+        var errors: [String] = []
+    }
+
+    /// Moves the FILES behind `items`, not the items themselves.
+    ///
+    /// This distinction is the whole bug it replaces. A variable font is one
+    /// file exposing many faces, and each face is its own `FontItem`, so the
+    /// old per-item loop tried to move `ABCDiatypeMonoVariableEdu.ttf` nine
+    /// times: the first succeeded and the other eight failed with "an item
+    /// with the same name already exists". Deduplicating by path fixes both
+    /// the errors and the wasted work.
+    ///
+    /// Nothing published is touched inside the loop — mutating `items` per file
+    /// re-rendered every observing view and is what made the duplicate purge
+    /// appear to hang.
+    func moveFontFiles(_ toMove: [FontItem], destination: (FontItem) -> URL) async -> MoveReport {
+        var report = MoveReport()
+        cancelMove = false
+
+        // One entry per distinct file, carrying every face that points at it.
+        var byPath: [String: [FontItem]] = [:]
+        for item in toMove { byPath[item.fileURL.path, default: []].append(item) }
+        let files = byPath.sorted { $0.key < $1.key }
+        moveProgress = MoveProgress(done: 0, total: files.count)
+
+        // Release Core Text handles for anything registered, in one call.
+        let active = toMove.filter { activeFontIDs.contains($0.id) }
+        if !active.isEmpty { try? await activator.deactivate(active) }
+        var deactivated = Set(active.map { $0.id })
+
+        var patched: [String: URL] = [:]      // old path -> new URL
+        let fm = FileManager.default
+
+        for (i, (path, faces)) in files.enumerated() {
+            guard let first = faces.first else { continue }
+            let folder = destination(first).standardizedFileURL
+            do {
+                try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                report.errors.append("\(folder.lastPathComponent): \(error.localizedDescription)")
+                continue
+            }
+
+            let source = URL(fileURLWithPath: path)
+            guard fm.fileExists(atPath: path) else {
+                report.skipped.append("\(source.lastPathComponent) — already gone")
+                continue
+            }
+
+            // Name collisions are real here: two different fonts can share a
+            // filename. Suffix rather than overwrite or fail, so nothing is
+            // silently lost.
+            var target = folder.appendingPathComponent(source.lastPathComponent)
+            if fm.fileExists(atPath: target.path) {
+                let stem = source.deletingPathExtension().lastPathComponent
+                let ext = source.pathExtension
+                var n = 2
+                repeat {
+                    target = folder.appendingPathComponent("\(stem) (\(n)).\(ext)")
+                    n += 1
+                } while fm.fileExists(atPath: target.path) && n < 500
+                report.renamed += 1
+            }
+
+            do {
+                try fm.moveItem(at: source, to: target)
+                patched[path] = target
+                report.filesMoved += 1
+                report.facesUpdated += faces.count
+            } catch {
+                report.errors.append("\(source.lastPathComponent): \(error.localizedDescription)")
+            }
+
+            if i % 25 == 0 {
+                moveProgress = MoveProgress(done: i, total: files.count,
+                                            currentFile: source.lastPathComponent)
+                await Task.yield()
+                if cancelMove { break }
+            }
+        }
+
+        moveProgress = nil
+        activeFontIDs.subtract(deactivated)
+        deactivated.removeAll()
+        guard !patched.isEmpty else { return report }
+
+        // Re-point every face at its file's new location, preserving ids so
+        // favorites and projects keep resolving.
+        for idx in items.indices {
+            guard let newURL = patched[items[idx].fileURL.path] else { continue }
+            let old = items[idx]
+            items[idx] = FontItem(
+                id: old.id, fileURL: newURL, postScriptName: old.postScriptName,
+                familyName: old.familyName, styleName: old.styleName,
+                displayName: old.displayName, weight: old.weight, width: old.width,
+                slant: old.slant, isItalic: old.isItalic, isMonospaced: old.isMonospaced,
+                isBold: old.isBold, format: old.formatKind, categories: old.categories,
+                moods: old.moods, glyphCount: old.glyphCount, fileSize: old.fileSize,
+                dateAdded: old.dateAdded, panose: old.panose,
+                variationAxes: old.variationAxes, foundry: old.foundry)
+        }
+        invalidateDerived()
+        scheduleCacheSave()
+        return report
+    }
+
     func moveFontFile(_ item: FontItem, to destinationFolder: URL) async throws {
         // Deactivate before moving so Core Text's URL handle is released.
         if activeFontIDs.contains(item.id) {
