@@ -1615,7 +1615,16 @@ final class FontLibrary: ObservableObject {
         var deactivatedIDs: Set<String> = []
 
         cancelDelete = false
-        let totalPlanned = decisions.reduce(0) { $0 + $1.group.paths.count - 1 }
+        // Count what will actually be attempted, not every non-keeper copy.
+        // Protected files are skipped, so including them made the progress
+        // view's total (43,034) disagree with the confirmation's count
+        // (41,894) for the same operation.
+        let facts = pathFacts
+        let totalPlanned = decisions.reduce(0) { running, d in
+            running + d.group.paths.filter {
+                $0 != d.keeper && facts[$0.path]?.isProtected != true
+            }.count
+        }
         deleteProgress = DeleteProgress(done: 0, total: totalPlanned)
 
         // Deactivate everything that is actually registered, in ONE call.

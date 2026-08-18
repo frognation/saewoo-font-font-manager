@@ -90,26 +90,26 @@ struct DuplicatesView: View {
     /// how to get it back.
     private var confirmMessage: String {
         let p = lib.policyPreview
-        var s = "\(deletableCount)개 파일 · "
+        var s = "\(deletableCount) files · "
         s += ByteCountFormatter.string(fromByteCount: reclaimable, countStyle: .file)
-        s += "를 휴지통으로 보냅니다.\n\n"
-        s += "지워지는 파일은 남기는 사본과 바이트 단위로 완전히 같습니다. "
-        s += "각 서체는 남는 사본 안에 그대로 있으므로 폰트를 잃지 않습니다.\n\n"
+        s += " will be moved to the Trash.\n\n"
+        s += "Every file listed is byte-for-byte identical to the copy being kept. "
+        s += "Each face still exists in that copy, so no font is lost.\n\n"
         if let byLoc = p?.deletionsByLocation, !byLoc.isEmpty {
-            s += "삭제 위치\n"
+            s += "Deleted from\n"
             for (k, n) in byLoc.sorted(by: { $0.value > $1.value }).prefix(5) {
-                s += "  · \(k): \(n)개\n"
+                s += "  · \(k): \(n)\n"
             }
             if byLoc.keys.contains(where: { $0 == "Dropbox" || $0 == "Cloud Drive" }) {
-                s += "\n⚠️ 클라우드 폴더 삭제는 동기화된 다른 기기에도 반영됩니다.\n"
+                s += "\n⚠️ Deletions in a cloud folder propagate to every synced machine.\n"
             }
             s += "\n"
         }
         if let skipped = p?.protectedSkipped, skipped > 0 {
-            s += "시스템 필수 폰트 \(skipped)개는 보호되어 제외됩니다.\n\n"
+            s += "\(skipped) macOS essentials are protected and will be skipped.\n\n"
         }
-        s += "휴지통에서 복구할 수 있고, 삭제 기록(어디→어디)이 DeletionManifests 폴더에 저장됩니다. "
-        s += "즐겨찾기와 프로젝트는 남는 사본으로 자동 연결됩니다."
+        s += "Recoverable from the Trash, and a deleted → kept manifest is written to DeletionManifests. "
+        s += "Favorites and projects are re-pointed at the surviving copy automatically."
         return s
     }
 
@@ -160,9 +160,9 @@ struct DuplicatesView: View {
         VStack(spacing: 14) {
             ProgressView(value: Double(p.done), total: Double(max(p.total, 1)))
                 .frame(width: 380)
-            Text("\(p.done) / \(p.total) 삭제됨")
+            Text("\(p.done) / \(p.total) deleted")
                 .font(.title3).monospacedDigit()
-            Text(ByteCountFormatter.string(fromByteCount: p.bytes, countStyle: .file) + " 회수")
+            Text(ByteCountFormatter.string(fromByteCount: p.bytes, countStyle: .file) + " reclaimed")
                 .font(.callout).foregroundStyle(.secondary)
             if !p.currentFile.isEmpty {
                 Text(p.currentFile)
@@ -170,9 +170,9 @@ struct DuplicatesView: View {
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     .frame(maxWidth: 420)
             }
-            Button("중단", role: .destructive) { lib.requestCancelDelete() }
+            Button("Stop", role: .destructive) { lib.requestCancelDelete() }
                 .padding(.top, 4)
-            Text("중단해도 그때까지 지운 파일은 휴지통에 있고, 기록도 남습니다.")
+            Text("Stopping is safe — what is already deleted stays in the Trash and is still recorded.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -216,7 +216,7 @@ struct DuplicatesView: View {
     private var actionBar: some View {
         HStack(spacing: 10) {
             Button("Rescan") { Task { await lib.scanContentDuplicates() } }
-            Text("위 기준이 전체에 적용됩니다. 특정 그룹만 다르게 하려면 그 줄을 클릭하세요.")
+            Text("The rules above apply to every group. Click a row to override one.")
                 .font(.caption2).foregroundStyle(.secondary)
             Spacer()
             Button("Select All") { excluded.removeAll() }
