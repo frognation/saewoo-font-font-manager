@@ -34,18 +34,19 @@ struct DuplicatesView: View {
               .map { ($0, keeper(for: $0)) }
     }
 
-    private var reclaimable: Int64 {
-        pending.reduce(0) { $0 + $1.group.size * Int64($1.group.paths.count - 1) }
-    }
-    private var deletableCount: Int {
-        pending.reduce(0) { $0 + $1.group.paths.count - 1 }
-    }
+    /// Read from the cached policy preview. Deriving these by walking every
+    /// group inside `body` meant each render recomputed a keeper for all
+    /// 23 644 groups — the reason a purge appeared to hang.
+    private var reclaimable: Int64 { lib.policyPreview?.bytesReclaimed ?? 0 }
+    private var deletableCount: Int { lib.policyPreview?.filesDeleted ?? 0 }
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            if lib.isScanningDuplicates {
+            if let prog = lib.deleteProgress {
+                deleting(prog)
+            } else if lib.isScanningDuplicates {
                 scanning
             } else if groups.isEmpty {
                 idle
@@ -66,16 +67,15 @@ struct DuplicatesView: View {
         ) {
             Button("Move to Trash", role: .destructive) {
                 let batch = pending
-                Task { report = await lib.deleteDuplicates(batch) }
+                Task {
+                    report = await lib.deleteDuplicates(batch)
+                    // Surviving groups and the policy numbers both changed.
+                    lib.schedulePolicyPreview()
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("""
-            Every file listed is byte-for-byte identical to the copy being kept, \
-            so nothing is lost — each removed face still exists in the keeper. \
-            Files go to the Trash, and a manifest of deleted → kept paths is saved. \
-            Favorites and projects are re-pointed at the surviving copy automatically.
-            """)
+            Text(confirmMessage)
         }
         .alert("Cleanup finished", isPresented: Binding(
             get: { report != nil }, set: { if !$0 { report = nil } })
@@ -84,6 +84,33 @@ struct DuplicatesView: View {
         } message: {
             if let r = report { Text(summary(r)) }
         }
+    }
+
+    /// Spelled out before the destructive click: what goes, from where, and
+    /// how to get it back.
+    private var confirmMessage: String {
+        let p = lib.policyPreview
+        var s = "\(deletableCount)개 파일 · "
+        s += ByteCountFormatter.string(fromByteCount: reclaimable, countStyle: .file)
+        s += "를 휴지통으로 보냅니다.\n\n"
+        s += "지워지는 파일은 남기는 사본과 바이트 단위로 완전히 같습니다. "
+        s += "각 서체는 남는 사본 안에 그대로 있으므로 폰트를 잃지 않습니다.\n\n"
+        if let byLoc = p?.deletionsByLocation, !byLoc.isEmpty {
+            s += "삭제 위치\n"
+            for (k, n) in byLoc.sorted(by: { $0.value > $1.value }).prefix(5) {
+                s += "  · \(k): \(n)개\n"
+            }
+            if byLoc.keys.contains(where: { $0 == "Dropbox" || $0 == "Cloud Drive" }) {
+                s += "\n⚠️ 클라우드 폴더 삭제는 동기화된 다른 기기에도 반영됩니다.\n"
+            }
+            s += "\n"
+        }
+        if let skipped = p?.protectedSkipped, skipped > 0 {
+            s += "시스템 필수 폰트 \(skipped)개는 보호되어 제외됩니다.\n\n"
+        }
+        s += "휴지통에서 복구할 수 있고, 삭제 기록(어디→어디)이 DeletionManifests 폴더에 저장됩니다. "
+        s += "즐겨찾기와 프로젝트는 남는 사본으로 자동 연결됩니다."
+        return s
     }
 
     private func summary(_ r: FontLibrary.DuplicateDeletionReport) -> String {
@@ -124,6 +151,31 @@ struct DuplicatesView: View {
             }
         }
         .padding(.horizontal, 16).padding(.vertical, 14)
+    }
+
+    /// Shown INSTEAD of the list during a purge. Rendering 23 644 group rows
+    /// while progress ticks is what made the old delete unusable.
+    @ViewBuilder
+    private func deleting(_ p: FontLibrary.DeleteProgress) -> some View {
+        VStack(spacing: 14) {
+            ProgressView(value: Double(p.done), total: Double(max(p.total, 1)))
+                .frame(width: 380)
+            Text("\(p.done) / \(p.total) 삭제됨")
+                .font(.title3).monospacedDigit()
+            Text(ByteCountFormatter.string(fromByteCount: p.bytes, countStyle: .file) + " 회수")
+                .font(.callout).foregroundStyle(.secondary)
+            if !p.currentFile.isEmpty {
+                Text(p.currentFile)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: 420)
+            }
+            Button("중단", role: .destructive) { lib.requestCancelDelete() }
+                .padding(.top, 4)
+            Text("중단해도 그때까지 지운 파일은 휴지통에 있고, 기록도 남습니다.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var scanning: some View {

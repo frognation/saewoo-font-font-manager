@@ -1102,6 +1102,18 @@ final class FontLibrary: ObservableObject {
     @Published private(set) var duplicateScanProgress: DuplicateScanner.Progress?
     @Published private(set) var isScanningDuplicates = false
 
+    /// Live delete progress. Deliberately the ONLY published thing that
+    /// changes while a purge runs — see `deleteDuplicates`.
+    struct DeleteProgress {
+        var done = 0
+        var total = 0
+        var bytes: Int64 = 0
+        var currentFile = ""
+    }
+    @Published private(set) var deleteProgress: DeleteProgress?
+    private var cancelDelete = false
+    func requestCancelDelete() { cancelDelete = true }
+
     /// Snapshot for the `--scan-duplicates` audit, which must hand the file
     /// list off the main actor before scanning.
     var uniqueFilesForAudit: [(url: URL, size: Int64)] { uniqueFiles }
@@ -1479,6 +1491,19 @@ final class FontLibrary: ObservableObject {
         var remap: [String: String] = [:]        // deleted FontItem.id -> kept id
         var deletedPaths: [String] = []
         var manifest: [[String: String]] = []
+        var deactivatedIDs: Set<String> = []
+
+        cancelDelete = false
+        let totalPlanned = decisions.reduce(0) { $0 + $1.group.paths.count - 1 }
+        deleteProgress = DeleteProgress(done: 0, total: totalPlanned)
+
+        // Deactivate everything that is actually registered, in ONE call.
+        // Per-file deactivation cost a CTFontManager round trip each time.
+        let victimIDs = Set(decisions.flatMap { d in
+            d.group.paths.filter { $0 != d.keeper }.flatMap { itemsAtPath($0).map(\.id) }
+        })
+        let stillActive = items.filter { activeFontIDs.contains($0.id) && victimIDs.contains($0.id) }
+        if !stillActive.isEmpty { try? await activator.deactivate(stillActive) }
 
         // Deterministic ordering used to pair faces between two identical
         // files when their PostScript names don't match. That happens more
@@ -1503,10 +1528,13 @@ final class FontLibrary: ObservableObject {
                     report.skipped.append("\(victim.lastPathComponent) — protected system font")
                     continue
                 }
-                do {
-                    try await activator.deactivate(faces)
-                } catch { /* deactivation is best-effort; the file still goes */ }
-                activeFontIDs.subtract(faces.map { $0.id })
+                // Collect, don't publish. Mutating `activeFontIDs` here — it
+                // is @Published — re-rendered all 14 observing views once per
+                // file, and DuplicatesView.body recomputes a keeper for every
+                // one of 23 644 groups. That, not the file I/O, is what made a
+                // purge take days: trashItem itself measures 3 ms locally and
+                // 9 ms inside Dropbox.
+                deactivatedIDs.formUnion(faces.map { $0.id })
 
                 do {
                     try FileManager.default.trashItem(at: victim, resultingItemURL: nil)
@@ -1529,9 +1557,23 @@ final class FontLibrary: ObservableObject {
                 report.filesDeleted += 1
                 report.facesRemoved += faces.count
                 report.bytesReclaimed += group.size
+
+                // Publish at intervals, and hand the main actor back so the
+                // progress view can actually draw.
+                if report.filesDeleted % 100 == 0 {
+                    deleteProgress = DeleteProgress(
+                        done: report.filesDeleted, total: totalPlanned,
+                        bytes: report.bytesReclaimed,
+                        currentFile: victim.lastPathComponent)
+                    await Task.yield()
+                    if cancelDelete { break }
+                }
             }
+            if cancelDelete { break }
         }
 
+        deleteProgress = nil
+        activeFontIDs.subtract(deactivatedIDs)
         guard report.filesDeleted > 0 else { return report }
 
         // Re-point curation at the surviving identical copy.
