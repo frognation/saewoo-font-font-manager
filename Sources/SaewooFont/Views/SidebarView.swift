@@ -168,10 +168,12 @@ struct SidebarView: View {
                      title: ToolKind.duplicates.label,
                      icon: ToolKind.duplicates.icon,
                      tint: ToolKind.duplicates.tint,
-                     // Content-identical groups, not PostScript-name collisions.
-                     // The old badge showed 21 949 "duplicates" that were mostly
-                     // different fonts sharing a name; it invited a destructive click.
-                     count: lib.contentDuplicates.isEmpty ? nil : lib.contentDuplicates.count)
+                     // Deletable copies, not group count. Groups whose every
+                     // extra copy is a protected system font can't be acted on,
+                     // and after a full purge those are all that remain — a
+                     // badge reading "420" over a screen that can delete
+                     // nothing is just confusing.
+                     count: (lib.policyPreview?.filesDeleted).flatMap { $0 > 0 ? $0 : nil })
             rowLabel(.tool(.organize),
                      title: ToolKind.organize.label,
                      icon: ToolKind.organize.icon,

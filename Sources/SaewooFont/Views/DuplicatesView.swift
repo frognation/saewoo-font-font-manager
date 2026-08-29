@@ -144,9 +144,15 @@ struct DuplicatesView: View {
             if !groups.isEmpty {
                 VStack(alignment: .trailing, spacing: 2) {
                     Text("\(groups.count) groups").font(.caption).bold()
-                    Text(ByteCountFormatter.string(fromByteCount: reclaimable, countStyle: .file)
-                         + " reclaimable")
-                        .font(.caption2).foregroundStyle(.secondary)
+                    if deletableCount > 0 {
+                        Text(ByteCountFormatter.string(fromByteCount: reclaimable, countStyle: .file)
+                             + " reclaimable")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    } else {
+                        // "Zero KB reclaimable" reads like a bug. Say why.
+                        Text("nothing to remove — all protected")
+                            .font(.caption2).foregroundStyle(.green)
+                    }
                 }
             }
         }
